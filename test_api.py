@@ -114,15 +114,15 @@ async def test_websocket(ticket: dict):
         ) as ws:
             logger.info("WebSocket connected! Listening for 10 seconds...")
             try:
-                async with asyncio.timeout(10):
+                async with asyncio.timeout(60):
                     async for raw in ws:
                         try:
                             msg = json.loads(raw)
-                            logger.info(f"<< WS message: {json.dumps(msg, indent=2)[:500]}")
+                            logger.info(f"<< WS message: {json.dumps(msg, indent=2)[:800]}")
                         except Exception:
                             logger.info(f"<< WS raw: {raw[:300]}")
             except asyncio.TimeoutError:
-                logger.info("10s elapsed — closing cleanly")
+                logger.info("60s elapsed — closing cleanly")
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
 

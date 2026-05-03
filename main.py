@@ -60,20 +60,20 @@ async def run_once():
 
     target = None
     for device in devices:
-        if device.get("serialNumber") == DEVICE_ID:
+        if device.get("serialNumber") == DEVICE_ID or device.get("addxSn") == DEVICE_ID:
             target = device
             break
 
     if target is None:
-        available = [f"{d.get('serialNumber')} ({d.get('name')})" for d in devices]
+        available = [f"{d.get('serialNumber')} / addxSn={d.get('addxSn')} ({d.get('deviceName')})" for d in devices]
         raise RuntimeError(
             f"Device {DEVICE_ID!r} not found. Available devices: {available}\n"
             "Set DEVICE_ID to one of the serial numbers above."
         )
 
     logger.info(
-        f"Device found: {target.get('name')!r} sn={target['serialNumber']} "
-        f"onAddx={target.get('onAddx')} region={target.get('region')}"
+        f"Device found: {target.get('deviceName')!r} sn={target['serialNumber']} "
+        f"addxSn={target.get('addxSn')} onAddx={target.get('onAddx')} region={target.get('region')}"
     )
 
     on_addx = target.get("onAddx", False)

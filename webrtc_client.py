@@ -142,10 +142,17 @@ async def connect_and_stream(
     pc = RTCPeerConnection(configuration=config)
     ffmpeg_state: dict = {"proc": None, "size": None}
 
-    # IDs for signaling messages
-    sender_id = f"web-{a4x_user_id or uuid.uuid4().hex[:8]}-{int(asyncio.get_event_loop().time() * 1000)}"
+    # Tell aiortc we want to receive video (and audio if camera sends it).
+    # Without this the SDP offer has no m= lines and the server drops the connection.
+    pc.addTransceiver("video", direction="recvonly")
+    pc.addTransceiver("audio", direction="recvonly")
+
+    # IDs for signaling messages.
+    # sender_id must match ticket["id"] — that is how the signaling server identifies us.
+    # (confirmed from PEER_IN recipientClientId matching ticket.id, not the Netvue userID)
+    sender_id = str(ticket.get("id") or a4x_user_id or uuid.uuid4().hex[:8])
     session_id = sender_id
-    # recipient is the camera — empty string means broadcast to master
+    # recipient is the camera's addxSn (its master client ID)
     recipient_id = serial_number or ""
 
     @pc.on("track")
@@ -210,7 +217,7 @@ async def connect_and_stream(
             # Set up ICE candidate handler (queues until offer is sent)
             @pc.on("icecandidate")
             async def on_ice_candidate(candidate):
-                if candidate and ws.open:
+                if candidate and ws.close_code is None:
                     await offer_sent.wait()  # don't send ICE before offer
                     msg = _ice_candidate_msg(candidate, master_id[0], sender_id, session_id)
                     cached_candidate_str[0] = json.dumps(msg)

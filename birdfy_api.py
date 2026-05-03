@@ -327,7 +327,62 @@ async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_re
                 f"groupId={ticket.get('groupId')} role={ticket.get('role')} "
                 f"id={ticket.get('id')}"
             )
-            return ticket
+
+        # ── Step 3: startlive — wake the camera before connecting to WS ──────
+        await _start_live(session, addx_endpoint, addx_token, ticket, addx_sn, language, country_no)
+
+        return ticket
+
+
+async def _start_live(session, endpoint: str, addx_token: str, ticket: dict, addx_sn: str, language: str, country_no: str):
+    """
+    Tell the camera to start its live stream session.
+
+    Must be called after getWebrtcTicket and before (or concurrently with) connecting
+    to the signaling WebSocket. Without this the camera sends PEER_OUT immediately
+    without ever sending an SDP_ANSWER.
+
+    connectionId format (from web app JS): "<groupId>:<role>:<id>:"":<epoch_ms/100>"
+    """
+    ts_ms = int(time.time() * 1000)
+    group_id = ticket.get("groupId", "")
+    role = ticket.get("role", "viewer")
+    client_id = str(ticket.get("id", ""))
+    connection_id = f'{group_id}:{role}:{client_id}:"":{ts_ms // 100}'
+
+    body = {
+        "requestId": uuid.uuid4().hex,
+        "language": language,
+        "countryNo": country_no.upper(),
+        "app": _APP_OBJECT,
+        "serialNumber": addx_sn,
+        "timestamp": ts_ms,
+        "connectionId": connection_id,
+        "size": "auto",
+        "action": "startLive",
+    }
+    headers = {
+        "Authorization": addx_token,
+        "Content-Type": "application/json",
+        "User-Agent": "NeWing/5.0 (web)",
+    }
+    url = f"{endpoint}device/startlive"
+    logger.info(f"START LIVE -> {url} connectionId={connection_id}")
+    try:
+        async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            text = await resp.text()
+            logger.debug(f"  HTTP {resp.status}: {text[:400]}")
+            if resp.status != 200:
+                logger.warning(f"startlive HTTP {resp.status} (non-fatal): {text[:200]}")
+            else:
+                result_body = json.loads(text)
+                result_code = (result_body.get("data") or result_body).get("result", result_body.get("code", 0))
+                if result_code != 0:
+                    logger.warning(f"startlive result={result_code} (non-fatal): {text[:200]}")
+                else:
+                    logger.info("startlive OK")
+    except Exception as e:
+        logger.warning(f"startlive call failed (non-fatal): {e}")
 
 
 async def get_stream_play(auth_data: dict, device: dict, provider: str = "KVS_WEBRTC") -> dict:
