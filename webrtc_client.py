@@ -32,8 +32,44 @@ import uuid
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
+import aioice.ice
+import aioice.stun as stun
 
 logger = logging.getLogger(__name__)
+
+# --- MONKEY PATCH AIOICE FOR ADDX CAMERAS ---
+# Addx cameras send invalid STUN Binding Requests (either role conflicts or wrong usernames).
+# aioice strictly rejects these with 400/487 BINDING.ERROR. We patch request_received
+# to always reply with BINDING.SUCCESS so the camera's ICE agent proceeds to DTLS.
+_orig_request_received = aioice.ice.Connection.request_received
+
+def _patched_request_received(self, message, addr, protocol, raw_data):
+    if message.message_method == stun.Method.BINDING:
+        # Addx cameras send BINDING REQUESTs with wrong remote ufrag (e.g. "7J4Y:UtJx"
+        # where UtJx != nzQ8 from their SDP answer). aioice responds with 400 Bad Request,
+        # the camera never believes ICE is established, and DTLS never starts.
+        # Fix: skip the original (which sends ERROR) and always send SUCCESS so the camera
+        # can complete its ICE state machine and proceed to the DTLS handshake.
+        response = stun.Message(
+            message_method=stun.Method.BINDING,
+            message_class=stun.Class.RESPONSE,
+            transaction_id=message.transaction_id,
+        )
+        response.attributes["XOR-MAPPED-ADDRESS"] = addr
+        if self.local_password:
+            response.add_message_integrity(self.local_password.encode("utf8"))
+        protocol.send_stun(response, addr)
+        # Best-effort ICE state management (no-op if check_incoming raises)
+        try:
+            if self._check_list:
+                self.check_incoming(message, addr, protocol)
+        except Exception:
+            pass
+    else:
+        _orig_request_received(self, message, addr, protocol, raw_data)
+
+aioice.ice.Connection.request_received = _patched_request_received
+# --------------------------------------------
 
 # How long to wait between frames before declaring the track dead
 FRAME_TIMEOUT = 30
