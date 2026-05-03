@@ -54,6 +54,7 @@ import hmac
 import json
 import logging
 import os
+import pathlib
 import time
 import uuid
 
@@ -63,7 +64,21 @@ logger = logging.getLogger(__name__)
 
 # App constants (observed in web app bundle)
 NVS_UCID = os.getenv("NVS_UCID", "513774810c")
-NVS_UDID = os.getenv("NVS_UDID", uuid.uuid4().hex)
+
+# Persist UDID so the Netvue backend sees the same "device" on every restart
+# and doesn't spam "new device connected" notifications.
+_UDID_FILE = pathlib.Path.home() / ".birdfy_nvs_udid"
+if os.getenv("NVS_UDID"):
+    NVS_UDID = os.getenv("NVS_UDID")
+elif _UDID_FILE.exists():
+    NVS_UDID = _UDID_FILE.read_text().strip()
+else:
+    NVS_UDID = uuid.uuid4().hex
+    try:
+        _UDID_FILE.write_text(NVS_UDID)
+        logger.info(f"Generated new NVS_UDID and saved to {_UDID_FILE}")
+    except Exception:
+        pass
 
 # Global auth state — populated by login()
 _auth_state: dict = {}

@@ -27,48 +27,122 @@ import base64
 import json
 import logging
 import subprocess
+import tempfile
 import uuid
 
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.sdp import candidate_from_sdp
+from aiortc.rtcdtlstransport import RTCDtlsTransport
 import aioice.ice
 import aioice.stun as stun
+from aioice.candidate import candidate_priority
 
 logger = logging.getLogger(__name__)
 
-# --- MONKEY PATCH AIOICE FOR ADDX CAMERAS ---
-# Addx cameras send invalid STUN Binding Requests (either role conflicts or wrong usernames).
-# aioice strictly rejects these with 400/487 BINDING.ERROR. We patch request_received
-# to always reply with BINDING.SUCCESS so the camera's ICE agent proceeds to DTLS.
+# --- MONKEY PATCH AIOICE + AIORTC FOR ADDX CAMERAS ---
+# Bug 1 — wrong ufrag in outgoing BINDING_REQs (intermittent):
+#   Camera sometimes sends USERNAME='ours:stale_ufrag' where stale_ufrag != its SDP ufrag.
+#   Original aioice rejects with 400; camera never completes ICE on its side.
+#
+# Bug 2 — aioice nominates once then stops (ice.py:850, ice.py:880-940):
+#   After our first USE-CANDIDATE check succeeds, aioice never sends another. If the
+#   camera missed/rejected that single check, it sits in "checking" forever, hammering
+#   us with BINDING_REQs at ~50ms intervals. THE HAMMER below sends a fresh
+#   BINDING_REQ + USE-CANDIDATE on every camera ping, sidestepping aioice's state
+#   machine entirely.
+#
+# Bug 3 — camera says setup:active but never sends DTLS ClientHello:
+#   Camera's ICE stays "checking" → never initiates DTLS. We force aiortc to be the
+#   DTLS client so WE send the ClientHello. If the camera firmware is libwebrtc-derived
+#   (as Tuya/Vicohome/Hisilicon stacks typically are), it has a DTLS server ready
+#   regardless of the SDP role declaration.
 _orig_request_received = aioice.ice.Connection.request_received
+_ufrag_done: set = set()  # connections where we've already updated remote_username
 
 def _patched_request_received(self, message, addr, protocol, raw_data):
-    if message.message_method == stun.Method.BINDING:
-        # Addx cameras send BINDING REQUESTs with wrong remote ufrag (e.g. "7J4Y:UtJx"
-        # where UtJx != nzQ8 from their SDP answer). aioice responds with 400 Bad Request,
-        # the camera never believes ICE is established, and DTLS never starts.
-        # Fix: skip the original (which sends ERROR) and always send SUCCESS so the camera
-        # can complete its ICE state machine and proceed to the DTLS handshake.
-        response = stun.Message(
-            message_method=stun.Method.BINDING,
-            message_class=stun.Class.RESPONSE,
-            transaction_id=message.transaction_id,
-        )
-        response.attributes["XOR-MAPPED-ADDRESS"] = addr
-        if self.local_password:
-            response.add_message_integrity(self.local_password.encode("utf8"))
-        protocol.send_stun(response, addr)
-        # Best-effort ICE state management (no-op if check_incoming raises)
+    if message.message_method != stun.Method.BINDING:
+        return _orig_request_received(self, message, addr, protocol, raw_data)
+
+    # 1. Update remote ufrag on first mismatch (camera's stale-session bug)
+    username = message.attributes.get("USERNAME", "")
+    conn_id = id(self)
+    if username and ":" in username and conn_id not in _ufrag_done:
+        their_ufrag = username.split(":", 1)[1]
+        if self.remote_username and self.remote_username != their_ufrag:
+            logger.warning(
+                f"aioice: ufrag mismatch — SDP={self.remote_username!r} "
+                f"camera={their_ufrag!r}; updating remote_username"
+            )
+            self.remote_username = their_ufrag
+            _ufrag_done.add(conn_id)
+
+    # 2. Diagnostic: log pair state for this addr
+    pair_state = "no-pair"
+    for p in self._check_list:
+        if p.remote_addr == addr:
+            pair_state = (
+                f"{p.state.name} nom={p.nominated} "
+                f"task={'set' if p.task else 'none'}"
+            )
+            break
+    logger.debug(
+        f"camera REQ from {addr} user={username!r} "
+        f"use_cand={'USE-CANDIDATE' in message.attributes} pair={pair_state}"
+    )
+
+    # 3. Always respond SUCCESS (signed with our local_password — adds MESSAGE-INTEGRITY + FINGERPRINT)
+    response = stun.Message(
+        message_method=stun.Method.BINDING,
+        message_class=stun.Class.RESPONSE,
+        transaction_id=message.transaction_id,
+    )
+    response.attributes["XOR-MAPPED-ADDRESS"] = addr
+    if self.local_password:
+        response.add_message_integrity(self.local_password.encode("utf8"))
+    protocol.send_stun(response, addr)
+
+    # 4. THE HAMMER: fire a fresh USE-CANDIDATE on every camera ping.
+    # Bypasses aioice's "nominate once then stop" behavior so the camera always has
+    # a fresh, valid USE-CANDIDATE check arriving with the correct ufrag and HMAC.
+    if self.ice_controlling and self.remote_username and self.remote_password:
         try:
-            if self._check_list:
-                self.check_incoming(message, addr, protocol)
-        except Exception:
-            pass
-    else:
-        _orig_request_received(self, message, addr, protocol, raw_data)
+            component = protocol.local_candidate.component
+            req = stun.Message(
+                message_method=stun.Method.BINDING,
+                message_class=stun.Class.REQUEST,
+            )
+            req.attributes["USERNAME"] = f"{self.remote_username}:{self.local_username}"
+            req.attributes["PRIORITY"] = candidate_priority(component, "prflx")
+            req.attributes["ICE-CONTROLLING"] = self._tie_breaker
+            req.attributes["USE-CANDIDATE"] = None  # flag attr
+            req.add_message_integrity(self.remote_password.encode("utf8"))
+            protocol.send_stun(req, addr)
+        except Exception as e:
+            logger.debug(f"hammer failed (non-fatal): {e}")
+
+    # 5. Best-effort triggered-check (no-op once pair is SUCCEEDED)
+    try:
+        if self._check_list:
+            self.check_incoming(message, addr, protocol)
+    except Exception:
+        pass
 
 aioice.ice.Connection.request_received = _patched_request_received
+
+# --- AIORTC: force DTLS client role ---
+# Camera SDP answers with setup:active, so aiortc would be passive (server) and wait
+# for ClientHello forever. We flip self._role BEFORE original start() reads it at
+# rtcdtlstransport.py:522 (where it picks set_accept_state vs set_connect_state).
+_orig_dtls_start = RTCDtlsTransport.start
+
+async def _patched_dtls_start(self, remoteParameters):
+    if self._role == "server":
+        logger.warning("DTLS: forcing CLIENT role despite remote setup:active")
+        self._role = "client"
+    return await _orig_dtls_start(self, remoteParameters)
+
+RTCDtlsTransport.start = _patched_dtls_start
 # --------------------------------------------
 
 # How long to wait between frames before declaring the track dead
@@ -414,7 +488,7 @@ def _start_ffmpeg(width: int, height: int, rtsp_output: str) -> subprocess.Popen
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=open("/tmp/ffmpeg_birdfy.log", "w"),
+        stderr=open(tempfile.gettempdir() + "/ffmpeg_birdfy.log", "w"),
     )
 
 

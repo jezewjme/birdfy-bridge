@@ -18,6 +18,7 @@ Environment variables:
   DEVICE_ID            Camera serial number (e.g. "5372540233101051")
   RTSP_OUTPUT          RTSP push URL (default: rtsp://frigate:8554/birdfy)
   LOG_LEVEL            DEBUG / INFO / WARNING (default: INFO)
+  LOG_FILE             Path to file for logging output (default: birdfy-bridge.log)
 
   --- Optional overrides for NVS signing ---
   NVS_UCID             App client ID (default: 513774810c)
@@ -27,15 +28,25 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 
 from birdfy_api import get_addx_ticket, get_devices, login
 from webrtc_client import connect_and_stream
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+log_file = os.getenv("LOG_FILE", "birdfy-bridge.log")
+
+log_handlers = [logging.StreamHandler(sys.stdout)]
+if log_file:
+    log_path = Path(log_file)
+    if log_path.parent:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    stream=sys.stdout,
+    handlers=log_handlers,
     force=True,
 )
 logger = logging.getLogger("main")
