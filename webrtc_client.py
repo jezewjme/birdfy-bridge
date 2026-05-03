@@ -49,10 +49,14 @@ def _build_ws_url(ticket: dict) -> str:
     ts = ticket.get("time", "")
     sign = ticket.get("sign", "")
 
+    access_token = ticket.get("accessToken", "")
     url = (
         f"{signal_server}/{group_id}/{role}/{client_id}"
-        f"?traceId={trace_id}&time={ts}&sign={sign}&name=a4x"
+        f"?traceId={trace_id}&time={ts}&sign={sign}"
     )
+    if access_token:
+        url += f"&accessToken={access_token}"
+    url += "&name=a4x"
     logger.info(f"WebSocket URL: {url[:140]}...")
     return url
 
@@ -169,7 +173,7 @@ async def connect_and_stream(
 
     @pc.on("connectionstatechange")
     async def _state():
-        logger.info(f"WebRTC state → {pc.connectionState}")
+        logger.info(f"WebRTC state -> {pc.connectionState}")
 
     url = _build_ws_url(ticket)
     ping_interval = ticket.get("signalPingInterval", 2)
@@ -185,29 +189,33 @@ async def connect_and_stream(
         ) as ws:
             logger.info("WebSocket connected to Addx signaling server")
 
-            # Create and send SDP offer
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
+            # master_id is discovered from PEER_IN — camera sends this first
+            master_id: list = [recipient_id]  # default; overwritten on PEER_IN
+            offer_sent = asyncio.Event()
+            connected = asyncio.Event()
 
-            offer_msg = _sdp_offer_msg(
-                sdp=pc.localDescription.sdp,
-                recipient_id=recipient_id,
-                sender_id=sender_id,
-                session_id=session_id,
-            )
-            logger.debug(f"Sending SDP_OFFER (first 300): {json.dumps(offer_msg)[:300]}")
-            await ws.send(json.dumps(offer_msg))
+            async def _send_offer():
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
+                offer_msg = _sdp_offer_msg(
+                    sdp=pc.localDescription.sdp,
+                    recipient_id=master_id[0],
+                    sender_id=sender_id,
+                    session_id=session_id,
+                )
+                logger.debug(f"Sending SDP_OFFER to {master_id[0]} (first 300): {json.dumps(offer_msg)[:300]}")
+                await ws.send(json.dumps(offer_msg))
+                offer_sent.set()
 
-            # Set up ICE candidate handler
+            # Set up ICE candidate handler (queues until offer is sent)
             @pc.on("icecandidate")
             async def on_ice_candidate(candidate):
                 if candidate and ws.open:
-                    msg = _ice_candidate_msg(candidate, recipient_id, sender_id, session_id)
+                    await offer_sent.wait()  # don't send ICE before offer
+                    msg = _ice_candidate_msg(candidate, master_id[0], sender_id, session_id)
                     cached_candidate_str[0] = json.dumps(msg)
                     await ws.send(cached_candidate_str[0])
-                    logger.debug(f"Sent ICE candidate: {candidate.candidate[:80]}")
-
-            connected = asyncio.Event()
+                    logger.debug(f"Sent ICE candidate: {str(candidate)[:80]}")
 
             async for raw in ws:
                 try:
@@ -219,8 +227,20 @@ async def connect_and_stream(
                 msg_type = msg.get("messageType") or msg.get("type") or msg.get("signal") or ""
                 logger.debug(f"WS [{msg_type}]: {raw[:300]}")
 
+                # Camera announces itself — send our SDP offer in response
+                if msg_type == "PEER_IN" and not offer_sent.is_set():
+                    payload_b64 = msg.get("messagePayload", "")
+                    try:
+                        peer_info = json.loads(base64.b64decode(payload_b64).decode())
+                        if peer_info.get("role") == "master":
+                            master_id[0] = msg.get("senderClientId") or peer_info.get("id") or master_id[0]
+                            logger.info(f"PEER_IN from master {master_id[0]} — sending SDP offer")
+                    except Exception:
+                        logger.info(f"PEER_IN received — sending SDP offer")
+                    asyncio.ensure_future(_send_offer())
+
                 # SDP answer from camera
-                if msg_type in ("SDP_ANSWER", "sdp", "answer") or msg.get("type") == "answer":
+                elif msg_type in ("SDP_ANSWER", "sdp", "answer") or msg.get("type") == "answer":
                     payload = msg.get("messagePayload") or msg.get("body") or msg
                     # messagePayload is base64-encoded JSON: {"sdp": "...", "type": "answer"}
                     if isinstance(payload, str) and len(payload) > 50:
@@ -307,7 +327,7 @@ async def _stream_video(track, rtsp_output: str, state: dict):
             if state["size"] != (w, h):
                 _kill_ffmpeg(state)
                 state["size"] = (w, h)
-                logger.info(f"Starting ffmpeg: {w}x{h} → {rtsp_output}")
+                logger.info(f"Starting ffmpeg: {w}x{h} -> {rtsp_output}")
                 state["proc"] = _start_ffmpeg(w, h, rtsp_output)
 
             proc = state["proc"]

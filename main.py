@@ -82,12 +82,12 @@ async def run_once():
         # Step 3a: Addx WebRTC path
         device_region = target.get("region") or auth_data.get("region")
         logger.info(f"Device uses Addx WebRTC — fetching ticket (region={device_region}) ...")
-        ticket = await get_addx_ticket(auth_data, device_region=device_region)
+        ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
 
         a4x_user_id = str(auth_data.get("userID", ""))
         serial = target["serialNumber"]
 
-        logger.info(f"Connecting to Addx WebRTC → RTSP output: {RTSP_OUTPUT}")
+        logger.info(f"Connecting to Addx WebRTC -> RTSP output: {RTSP_OUTPUT}")
         await connect_and_stream(
             ticket=ticket,
             rtsp_output=RTSP_OUTPUT,

@@ -129,7 +129,7 @@ async def login(email: str, password: str) -> dict:
     async with aiohttp.ClientSession() as session:
         url = f"{AUTH_BASE}/users/login/v2"
         try:
-            logger.info(f"AUTH → {url}")
+            logger.info(f"AUTH -> {url}")
             async with session.post(
                 url,
                 json=payload,
@@ -191,7 +191,7 @@ async def get_devices(auth_data: dict) -> list:
     headers = _nvs_headers(token=token, user_id=user_id)
 
     async with aiohttp.ClientSession() as session:
-        logger.info(f"DEVICES → {url}")
+        logger.info(f"DEVICES -> {url}")
         async with session.get(
             url,
             headers=headers,
@@ -207,57 +207,123 @@ async def get_devices(auth_data: dict) -> list:
             return devices
 
 
-async def get_addx_ticket(auth_data: dict, device_region: str | None = None) -> dict:
+_APP_OBJECT = {
+    "bundle": "com.netviewtech.mynetvue",
+    "channelId": 1000,
+    "appBuild": "online-build",
+    "appName": "Netvue",
+    "tenantId": "netvue",
+    "countlyId": "",
+    "version": 99999,
+    "appType": "iOS",
+}
+
+
+async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_region: str | None = None) -> dict:
     """
     Get the Addx WebRTC signaling ticket for onAddx=True devices.
 
-    Calls GET {localEndpoint}/v1/addx/token/v2 with optional region param.
+    Two-step process (confirmed from my.birdfy.com JS bundles):
+      1. GET https://api2.nvts.co/addx/token/v2
+            Authorization: Bearer <login token>
+         -> returns {token, endpoint, language, countryNo, ...}
 
-    Returns ticket dict containing:
-        signalServer    — WebSocket host (e.g. "wss://signal.example.com")
-        groupId         — device group identifier
-        role            — viewer role string
-        id              — client/viewer ID
-        traceId         — trace ID for WebSocket URL
-        time            — timestamp for WebSocket URL
-        sign            — signature for WebSocket URL
-        iceServer       — list of {url, username, credential} TURN/STUN servers
-        signalPingInterval — heartbeat interval in seconds (default 2)
+      2. POST {endpoint}device/getWebrtcTicket
+            Authorization: <addx token from step 1>
+            body: {requestId, serialNumber: addxSn, app: {...}, ...}
+         -> returns {signalServer, groupId, role, id, traceId, time, sign, iceServer, ...}
 
-    WebSocket URL format:
-        {ticket.signalServer}/{ticket.groupId}/{ticket.role}/{ticket.id}
-        ?traceId={ticket.traceId}&time={ticket.time}&sign={ticket.sign}&name=a4x
+    WebSocket URL: {signalServer}/{groupId}/{role}/{id}?traceId=...&time=...&sign=...&name=a4x
     """
-    token = auth_data.get("token", "")
-    user_id = str(auth_data.get("userID", ""))
-    local_endpoint = auth_data.get("localEndpoint", "")
-    if not local_endpoint:
-        region = auth_data.get("region", "us-east-1")
-        local_endpoint = f"https://{region}-localweb.nvts.co"
-
-    params: dict = {}
-    if device_region:
-        params["region"] = device_region
-
-    url = f"{local_endpoint}/v1/addx/token/v2"
-    headers = _nvs_headers(token=token, user_id=user_id)
+    login_token = auth_data.get("token", "")
+    addx_sn = (device or {}).get("addxSn") or (device or {}).get("serialNumber", "")
+    region = device_region or (device or {}).get("region") or auth_data.get("region", "us-east-1")
 
     async with aiohttp.ClientSession() as session:
-        logger.info(f"ADDX TICKET → {url} params={params}")
-        async with session.get(
-            url,
-            params=params,
-            headers=headers,
+        # ── Step 1: Get addx token from api2.nvts.co ──────────────────────
+        addx_token_url = "https://api2.nvts.co/addx/token/v2"
+        params = {"region": region}
+
+        # Try different auth header formats until one works
+        nvs_hdrs = _nvs_headers(token=login_token, user_id=str(auth_data.get("userID", "")))
+        header_candidates = [
+            # NVS signature (same as localweb calls)
+            nvs_hdrs,
+            # Bearer only
+            {"Authorization": f"Bearer {login_token}", "x-nvs-version": '{"signature":2}',
+             "User-Agent": "NeWing/5.0 (web)"},
+            # NVS signature + Bearer combined
+            {**nvs_hdrs, "Authorization": f"Bearer {login_token}"},
+            # Plain token header
+            {"Authorization": login_token, "x-nvs-version": '{"signature":2}',
+             "User-Agent": "NeWing/5.0 (web)"},
+        ]
+
+        text = ""
+        for addx_headers in header_candidates:
+            logger.info(f"ADDX TOKEN -> {addx_token_url} auth_style={list(addx_headers.keys())[:3]}")
+            async with session.get(
+                addx_token_url,
+                params=params,
+                headers=addx_headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                text = await resp.text()
+                logger.debug(f"  HTTP {resp.status}: {text[:800]}")
+                if resp.status == 200:
+                    break
+                logger.warning(f"  HTTP {resp.status} with this auth style, trying next...")
+        else:
+            raise RuntimeError(f"Addx token failed with all auth styles. Last response: {text[:300]}")
+
+        body = json.loads(text)
+        addx_data = body.get("data") or body
+        addx_token = addx_data.get("token") or addx_data.get("accessToken")
+        addx_endpoint = addx_data.get("endpoint", "").rstrip("/") + "/"
+        language = addx_data.get("language", "en")
+        country_no = addx_data.get("countryNo", "US")
+        if not addx_token or not addx_endpoint:
+            logger.error(f"Addx token response: {text[:600]}")
+            raise RuntimeError(
+                "Addx token response missing 'token' or 'endpoint' fields. "
+                "Check DEBUG logs for full response."
+            )
+        logger.info(f"Addx token OK -- endpoint={addx_endpoint} language={language}")
+
+        # ── Step 2: Get WebRTC ticket from device endpoint ─────────────────
+        ticket_url = f"{addx_endpoint}device/getWebrtcTicket"
+        ticket_headers = {
+            "Authorization": addx_token,
+            "Content-Type": "application/json",
+            "User-Agent": "NeWing/5.0 (web)",
+        }
+        ticket_body = {
+            "requestId": uuid.uuid4().hex,
+            "language": language,
+            "countryNo": country_no.upper(),
+            "app": _APP_OBJECT,
+            "serialNumber": addx_sn,
+            "verifyDormancyStatus": True,
+        }
+
+        logger.info(f"WEBRTC TICKET -> {ticket_url} serialNumber={addx_sn}")
+        async with session.post(
+            ticket_url,
+            json=ticket_body,
+            headers=ticket_headers,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             text = await resp.text()
             logger.debug(f"  HTTP {resp.status}: {text[:800]}")
             if resp.status != 200:
-                raise RuntimeError(f"Addx ticket HTTP {resp.status}: {text[:300]}")
+                raise RuntimeError(f"WebRTC ticket HTTP {resp.status}: {text[:300]}")
             body = json.loads(text)
             ticket = body.get("data") or body
+            result = ticket.get("result", ticket.get("code", 0))
+            if result != 0:
+                raise RuntimeError(f"WebRTC ticket error result={result}: {text[:300]}")
             logger.info(
-                f"Ticket obtained — signalServer={ticket.get('signalServer')} "
+                f"Ticket OK -- signalServer={ticket.get('signalServer')} "
                 f"groupId={ticket.get('groupId')} role={ticket.get('role')} "
                 f"id={ticket.get('id')}"
             )
@@ -290,7 +356,7 @@ async def get_stream_play(auth_data: dict, device: dict, provider: str = "KVS_WE
     payload["provider"] = provider
 
     async with aiohttp.ClientSession() as session:
-        logger.info(f"STREAM PLAY → {url} provider={provider}")
+        logger.info(f"STREAM PLAY -> {url} provider={provider}")
         async with session.post(
             url,
             json=payload,
