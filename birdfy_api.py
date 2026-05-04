@@ -343,22 +343,40 @@ async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_re
                 f"id={ticket.get('id')}"
             )
 
-        # ── Step 3: startlive — wake the camera before connecting to WS ──────
-        await _start_live(session, addx_endpoint, addx_token, ticket, addx_sn, language, country_no)
+        # Stash addx state on the ticket so callers can fire start_live later
+        # (after ICE completes — see webrtc_client.connect_and_stream).
+        # Calling startlive at ticket-fetch time triggers result=-3021 DEVICE_NO_RESPONSE
+        # because the camera's WebRTC stack isn't yet listening for the cloud trigger.
+        ticket["_addx_endpoint"] = addx_endpoint
+        ticket["_addx_token"] = addx_token
+        ticket["_addx_sn"] = addx_sn
+        ticket["_language"] = language
+        ticket["_country_no"] = country_no
 
         return ticket
 
 
-async def _start_live(session, endpoint: str, addx_token: str, ticket: dict, addx_sn: str, language: str, country_no: str):
+async def start_live(ticket: dict) -> bool:
     """
     Tell the camera to start its live stream session.
 
-    Must be called after getWebrtcTicket and before (or concurrently with) connecting
-    to the signaling WebSocket. Without this the camera sends PEER_OUT immediately
-    without ever sending an SDP_ANSWER.
+    Call this AFTER WebRTC ICE has reached "completed" — the camera's WebRTC stack
+    needs to be ready to bind the cloud's startLive command to the active session.
+    Calling earlier returns result=-3021 DEVICE_NO_RESPONSE.
+
+    Pulls all needed state (endpoint, token, serial, locale) from the ticket dict
+    populated by get_addx_ticket.
 
     connectionId format (from web app JS): "<groupId>:<role>:<id>:"":<epoch_ms/100>"
+    The literal `""` field is suspect — pending web-app sniff to confirm.
+
+    Returns True if cloud accepted (result=0), False otherwise.
     """
+    endpoint = ticket["_addx_endpoint"]
+    addx_token = ticket["_addx_token"]
+    addx_sn = ticket["_addx_sn"]
+    language = ticket["_language"]
+    country_no = ticket["_country_no"]
     ts_ms = int(time.time() * 1000)
     group_id = ticket.get("groupId", "")
     role = ticket.get("role", "viewer")
@@ -384,20 +402,23 @@ async def _start_live(session, endpoint: str, addx_token: str, ticket: dict, add
     url = f"{endpoint}device/startlive"
     logger.info(f"START LIVE -> {url} connectionId={connection_id}")
     try:
-        async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            text = await resp.text()
-            logger.debug(f"  HTTP {resp.status}: {text[:400]}")
-            if resp.status != 200:
-                logger.warning(f"startlive HTTP {resp.status} (non-fatal): {text[:200]}")
-            else:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                text = await resp.text()
+                logger.debug(f"  HTTP {resp.status}: {text[:400]}")
+                if resp.status != 200:
+                    logger.warning(f"startlive HTTP {resp.status}: {text[:200]}")
+                    return False
                 result_body = json.loads(text)
                 result_code = (result_body.get("data") or result_body).get("result", result_body.get("code", 0))
                 if result_code != 0:
-                    logger.warning(f"startlive result={result_code} (non-fatal): {text[:200]}")
-                else:
-                    logger.info("startlive OK")
+                    logger.warning(f"startlive result={result_code}: {text[:200]}")
+                    return False
+                logger.info("startlive OK — camera should begin pushing RTP")
+                return True
     except Exception as e:
-        logger.warning(f"startlive call failed (non-fatal): {e}")
+        logger.warning(f"startlive call failed: {e}")
+        return False
 
 
 async def get_stream_play(auth_data: dict, device: dict, provider: str = "KVS_WEBRTC") -> dict:

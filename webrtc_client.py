@@ -32,8 +32,10 @@ import uuid
 
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+from aiortc.rtcconfiguration import RTCBundlePolicy
+
+from birdfy_api import start_live
 from aiortc.sdp import candidate_from_sdp
-from aiortc.rtcdtlstransport import RTCDtlsTransport
 import aioice.ice
 import aioice.stun as stun
 from aioice.candidate import candidate_priority
@@ -130,19 +132,13 @@ def _patched_request_received(self, message, addr, protocol, raw_data):
 
 aioice.ice.Connection.request_received = _patched_request_received
 
-# --- AIORTC: force DTLS client role ---
-# Camera SDP answers with setup:active, so aiortc would be passive (server) and wait
-# for ClientHello forever. We flip self._role BEFORE original start() reads it at
-# rtcdtlstransport.py:522 (where it picks set_accept_state vs set_connect_state).
-_orig_dtls_start = RTCDtlsTransport.start
-
-async def _patched_dtls_start(self, remoteParameters):
-    if self._role == "server":
-        logger.warning("DTLS: forcing CLIENT role despite remote setup:active")
-        self._role = "client"
-    return await _orig_dtls_start(self, remoteParameters)
-
-RTCDtlsTransport.start = _patched_dtls_start
+# NOTE: DTLS force-client patch was removed 2026-05-04.
+# It was needed only because BUNDLE was broken (BALANCED policy created two transports
+# and DTLS was being attached to the one whose ICE never completed, so the camera never
+# sent ClientHello). With bundlePolicy=MAX_BUNDLE there's a single transport and ICE
+# completes cleanly, so the camera honors its SDP setup:active role and sends ClientHello
+# as expected. Forcing our side to client made aiortc reject the camera's ClientHello
+# with a Fatal/Unexpected Message alert.
 # --------------------------------------------
 
 # How long to wait between frames before declaring the track dead
@@ -191,7 +187,12 @@ def _make_ice_config(ticket: dict) -> RTCConfiguration:
             servers.append(RTCIceServer(urls=urls, username=username, credential=credential))
             logger.debug(f"ICE server: {urls}")
 
-    return RTCConfiguration(iceServers=servers)
+    # MAX_BUNDLE forces all transceivers onto a single ICE/DTLS transport so the
+    # SDP offer has matching ufrag/pwd across m-lines. With the default BALANCED
+    # policy, video and audio each get their own transport (Connection(0)/(1) in
+    # aioice logs) — DTLS lands on one transport while ICE only succeeds on the
+    # other, so the handshake never completes against this camera.
+    return RTCConfiguration(iceServers=servers, bundlePolicy=RTCBundlePolicy.MAX_BUNDLE)
 
 
 def _b64_encode(obj) -> str:
@@ -257,6 +258,24 @@ async def connect_and_stream(
     pc.addTransceiver("video", direction="recvonly")
     pc.addTransceiver("audio", direction="recvonly")
 
+    # Create a data channel BEFORE the offer so the SDP includes an m=application
+    # section. The camera receives the startLive trigger over this channel — not via
+    # the HTTPS device/startlive API (which always returns -3021 for Addx cameras
+    # despite the cloud accepting the auth). Confirmed by sniffing my.birdfy.com:
+    # the webapp sends DTLS Application Data (SCTP-over-DTLS) immediately after the
+    # handshake, then bulk SRTP follows.
+    control_channel = pc.createDataChannel("a4xControl")
+
+    @control_channel.on("open")
+    def _control_open():
+        msg = json.dumps({"action": "startLive", "resolution": "auto"})
+        logger.info(f"Control channel open — sending startLive: {msg}")
+        control_channel.send(msg)
+
+    @control_channel.on("message")
+    def _control_msg(m):
+        logger.info(f"Control channel msg: {m!r}")
+
     # IDs for signaling messages.
     # sender_id must match ticket["id"] — that is how the signaling server identifies us.
     # (confirmed from PEER_IN recipientClientId matching ticket.id, not the Netvue userID)
@@ -291,6 +310,19 @@ async def connect_and_stream(
     @pc.on("connectionstatechange")
     async def _state():
         logger.info(f"WebRTC state -> {pc.connectionState}")
+
+    # Fire startlive ONCE when ICE reaches "completed". Calling earlier (during
+    # ticket setup) returns -3021 DEVICE_NO_RESPONSE because the camera's WebRTC
+    # stack isn't yet bound to the cloud session. Without a successful startlive
+    # the camera completes WebRTC + DTLS but never pushes RTP.
+    startlive_fired = {"v": False}
+
+    @pc.on("iceconnectionstatechange")
+    async def _ice_state():
+        logger.info(f"ICE state -> {pc.iceConnectionState}")
+        if pc.iceConnectionState == "completed" and not startlive_fired["v"]:
+            startlive_fired["v"] = True
+            await start_live(ticket)
 
     url = _build_ws_url(ticket)
     ping_interval = ticket.get("signalPingInterval", 2)
