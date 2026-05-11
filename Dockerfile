@@ -3,20 +3,13 @@ FROM python:3.12-slim-bookworm
 ARG TARGETARCH
 ARG S6_OVERLAY_VERSION=3.2.0.2
 
-# ffmpeg + build deps for aiortc (libav, opus, vpx, openssl) + xz-utils for s6 tarball extraction
+# Runtime deps only. aiortc 1.9+ and av 12+ ship manylinux wheels on PyPI for
+# amd64/arm64, so we don't need build toolchains or lib*-dev headers in the
+# final image. ffmpeg is used to re-encode + push the RTSP stream. curl and
+# xz-utils are needed during this build for the s6 + mediamtx downloads below;
+# leaving them in is cheap and useful for in-container debugging.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
-        gcc \
-        g++ \
-        libavcodec-dev \
-        libavformat-dev \
-        libavutil-dev \
-        libswscale-dev \
-        libswresample-dev \
-        libopus-dev \
-        libvpx-dev \
-        libssl-dev \
-        pkg-config \
         ca-certificates \
         curl \
         xz-utils \
@@ -70,5 +63,13 @@ ENV PYTHONUNBUFFERED=1 \
     RTSP_PATH=birdfy
 
 EXPOSE 8554/tcp 8554/udp
+
+# Healthcheck: MediaMTX exposes RTSP DESCRIBE on the same port. We use curl to
+# probe TCP reachability of the RTSP port — if MediaMTX is dead the bridge has
+# nowhere to publish to. Doesn't verify that the bridge itself is publishing
+# (that requires watching ffmpeg logs); keep it cheap.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS -m 3 -o /dev/null http://localhost:8554/ \
+        || exit 1
 
 ENTRYPOINT ["/init"]
