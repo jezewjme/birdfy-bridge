@@ -213,6 +213,17 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
 
             has_idr = NAL_IDR in nal_types
 
+            # Debug: log the first few frames' shape so we can see what aiortc
+            # actually hands us (start-code layout, NAL types observed).
+            if pre_proc_frames_dropped < 5 and proc is None:
+                head = data[:16].hex(" ")
+                logger.info(
+                    "RTP forwarder: frame %d bytes head=%s nal_types=%s",
+                    len(data),
+                    head,
+                    nal_types,
+                )
+
             if proc is None:
                 # Wait for a keyframe AND a known SPS+PPS before starting ffmpeg,
                 # otherwise the h264 demuxer errors with "non-existing PPS 0
