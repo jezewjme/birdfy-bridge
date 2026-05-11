@@ -619,13 +619,22 @@ async def _stream_video(track, rtsp_output: str, state: dict, pc=None):
 
 
 async def _pli_nudger(pc):
-    """Send RTCP PLI to the video sender every 2s until cancelled.
+    """Send RTCP PLI **and** FIR to the video sender every 2s until cancelled.
 
-    aiortc doesn't expose a public "request keyframe" API, so we reach into
-    the video receiver's _send_rtcp_pli with the active SSRC. If we can't
-    find a receiver/SSRC yet we wait and retry — the receiver appears once
-    the first RTP packet arrives.
+    The Birdfy camera advertises both `nack pli` and `ccm fir` in its answer
+    SDP. Empirically PLI alone is ignored — log capture shows 5+ PLIs sent
+    over 10s with no responding IDR. We send both each cycle: PLI via aiortc's
+    `_send_rtcp_pli`, and FIR (RFC 5104 §4.3.1) via a hand-built RtcpPsfbPacket
+    with fmt=RTCP_PSFB_FIR=4 and an 8-byte FCI (media_ssrc + seq_nr + 3 reserved).
+
+    FIR requires an incrementing seq_nr per RFC; repeats with the same seq_nr
+    are no-ops, so we bump it every cycle. aiortc doesn't expose a public
+    "request keyframe" API, so we reach into receiver internals.
     """
+    from struct import pack
+    from aiortc.rtp import RTCP_PSFB_FIR, RtcpPsfbPacket
+
+    fir_seq = 0
     try:
         # Wait briefly for the first RTP packet to populate __active_ssrc
         await asyncio.sleep(0.5)
@@ -637,18 +646,36 @@ async def _pli_nudger(pc):
                 receiver = transceiver.receiver
                 # name-mangled private: dict[ssrc -> last_seen]
                 active = getattr(receiver, "_RTCRtpReceiver__active_ssrc", {})
+                rtcp_ssrc = getattr(receiver, "_RTCRtpReceiver__rtcp_ssrc", None)
                 for ssrc in list(active.keys()):
+                    # PLI
                     try:
                         await receiver._send_rtcp_pli(ssrc)
                         sent = True
                         logger.debug(f"Sent PLI for video ssrc={ssrc}")
                     except Exception as e:
                         logger.debug(f"PLI send failed for ssrc={ssrc}: {e}")
-            if not sent:
-                logger.debug("PLI nudger: no active video SSRC yet")
+                    # FIR — only if we know our sender SSRC for the header
+                    if rtcp_ssrc is not None:
+                        try:
+                            fci = pack("!LBBBB", ssrc, fir_seq & 0xFF, 0, 0, 0)
+                            fir = RtcpPsfbPacket(
+                                fmt=RTCP_PSFB_FIR,
+                                ssrc=rtcp_ssrc,
+                                media_ssrc=0,  # RFC 5104: SHOULD be 0 for FIR
+                                fci=fci,
+                            )
+                            await receiver._send_rtcp(fir)
+                            logger.debug(f"Sent FIR seq={fir_seq} for video ssrc={ssrc}")
+                        except Exception as e:
+                            logger.debug(f"FIR send failed for ssrc={ssrc}: {e}")
+            if sent:
+                fir_seq = (fir_seq + 1) & 0xFF
+            else:
+                logger.debug("PLI/FIR nudger: no active video SSRC yet")
             await asyncio.sleep(2.0)
     except asyncio.CancelledError:
-        logger.debug("PLI nudger cancelled")
+        logger.debug("PLI/FIR nudger cancelled")
         raise
 
 
