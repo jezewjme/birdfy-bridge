@@ -1,0 +1,54 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. A few things up front:
+
+        - **Do not paste raw account credentials, tokens, or full device serial numbers.** DEBUG logs redact known-secret fields but please skim before pasting.
+        - This is an unaffiliated interop tool. If Netvue's app or cloud is broken, please report there, not here.
+  - type: checkboxes
+    id: ownership
+    attributes:
+      label: Camera ownership
+      description: We can only help with bridges to cameras you control.
+      options:
+        - label: I own this camera and the Birdfy account associated with it.
+          required: true
+        - label: I understand that using this tool may violate Netvue's Terms of Service and could result in account suspension.
+          required: true
+  - type: input
+    id: device
+    attributes:
+      label: Camera model and `onAddx` value
+      placeholder: e.g. "Birdfy Feeder Bamboo, onAddx=true"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you get?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (DEBUG level)
+      description: |
+        Set `LOG_LEVEL=DEBUG` and paste the relevant portion. Redact your device serial number if it appears.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: birdfy-bridge version / commit
+      placeholder: "v0.1.0 or commit sha"
+    validations:
+      required: true
+  - type: input
+    id: deployment
+    attributes:
+      label: How is the bridge running?
+      placeholder: "docker compose / bare python / NAS / etc."
