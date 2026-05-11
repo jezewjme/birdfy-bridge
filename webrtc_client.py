@@ -250,7 +250,7 @@ async def connect_and_stream(
     def on_track(track):
         logger.info(f"Track received: kind={track.kind}")
         if track.kind == "video":
-            asyncio.ensure_future(_stream_video(track, rtsp_output, ffmpeg_state))
+            asyncio.ensure_future(_stream_video(track, rtsp_output, ffmpeg_state, pc))
         else:
             asyncio.ensure_future(_drain(track))
 
@@ -530,8 +530,17 @@ async def connect_and_stream(
         await pc.close()
 
 
-async def _stream_video(track, rtsp_output: str, state: dict):
-    """Decode video frames from aiortc and pipe as rawvideo to ffmpeg → RTSP."""
+async def _stream_video(track, rtsp_output: str, state: dict, pc=None):
+    """Decode video frames from aiortc and pipe as rawvideo to ffmpeg → RTSP.
+
+    Sends RTCP PLI to the camera until the first decodable frame arrives. The
+    Birdfy camera only emits SPS/PPS at keyframe boundaries, and its default
+    keyframe cadence is long enough that aiortc spams "Invalid data found" on
+    every inter-frame until a keyframe shows up. A PLI tells the camera to
+    emit a keyframe now.
+    """
+    pli_task = asyncio.ensure_future(_pli_nudger(pc)) if pc is not None else None
+    got_valid_frame = False
     try:
         while True:
             try:
@@ -541,6 +550,16 @@ async def _stream_video(track, rtsp_output: str, state: dict):
                 break
 
             w, h = frame.width, frame.height
+
+            if w == 0 or h == 0:
+                # Decoder hasn't received a keyframe yet — skip until it has valid dims
+                continue
+
+            if not got_valid_frame:
+                got_valid_frame = True
+                if pli_task is not None and not pli_task.done():
+                    pli_task.cancel()
+                logger.info(f"First decoded frame: {w}x{h}")
 
             if state["size"] != (w, h):
                 _kill_ffmpeg(state)
@@ -563,7 +582,43 @@ async def _stream_video(track, rtsp_output: str, state: dict):
     except Exception as e:
         logger.error(f"Video stream error: {e}", exc_info=True)
     finally:
+        if pli_task is not None and not pli_task.done():
+            pli_task.cancel()
         _kill_ffmpeg(state)
+
+
+async def _pli_nudger(pc):
+    """Send RTCP PLI to the video sender every 2s until cancelled.
+
+    aiortc doesn't expose a public "request keyframe" API, so we reach into
+    the video receiver's _send_rtcp_pli with the active SSRC. If we can't
+    find a receiver/SSRC yet we wait and retry — the receiver appears once
+    the first RTP packet arrives.
+    """
+    try:
+        # Wait briefly for the first RTP packet to populate __active_ssrc
+        await asyncio.sleep(0.5)
+        while True:
+            sent = False
+            for transceiver in pc.getTransceivers():
+                if transceiver.kind != "video":
+                    continue
+                receiver = transceiver.receiver
+                # name-mangled private: dict[ssrc -> last_seen]
+                active = getattr(receiver, "_RTCRtpReceiver__active_ssrc", {})
+                for ssrc in list(active.keys()):
+                    try:
+                        await receiver._send_rtcp_pli(ssrc)
+                        sent = True
+                        logger.debug(f"Sent PLI for video ssrc={ssrc}")
+                    except Exception as e:
+                        logger.debug(f"PLI send failed for ssrc={ssrc}: {e}")
+            if not sent:
+                logger.debug("PLI nudger: no active video SSRC yet")
+            await asyncio.sleep(2.0)
+    except asyncio.CancelledError:
+        logger.debug("PLI nudger cancelled (first frame decoded)")
+        raise
 
 
 def _start_ffmpeg(width: int, height: int, rtsp_output: str) -> subprocess.Popen:
