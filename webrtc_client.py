@@ -329,7 +329,7 @@ async def connect_and_stream(
     try:
         async with websockets.connect(
             url,
-            additional_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
+            extra_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
             ping_interval=ping_interval,
             ping_timeout=10,
             close_timeout=5,
