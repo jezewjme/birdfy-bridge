@@ -1,3 +1,9 @@
+.git/
+.github/
+.gitignore
+.gitattributes
+.dockerignore
+
 # Python
 __pycache__/
 *.py[cod]
@@ -5,37 +11,40 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-build/
-dist/
-
-# Virtual envs
 .venv/
 venv/
 
-# Secrets / per-machine config
+# Secrets / per-machine
 .env
 .env.*
 !.env.example
 
-# Logs
+# Logs and captures
 *.log
-
-# Packet captures and HAR exports from protocol RE — never publish
 *.pcap
 *.pcapng
 *.har
 successful*.json
 captures/
 
-# Local debugging / handoff notes (not for publication)
+# Repo docs / dev artifacts not needed in the image
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
 HANDOFF.md
 prompt.md
 REVIEW_PROMPT.md
 REVIEW_REPORT.md
 patch_aioice.py
+tests/
+test_*.py
+requirements-dev.txt
 
 # IDE / OS
 .idea/
 .vscode/
+.claude/
 .DS_Store
 Thumbs.db
