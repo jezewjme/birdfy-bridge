@@ -15,7 +15,7 @@ Auth flow (reverse-engineered from my.birdfy.com web app, confirmed working):
 Environment variables:
   BIRDFY_EMAIL         Netvue/Birdfy account email
   BIRDFY_PASSWORD      Netvue/Birdfy account password (plain text; MD5'd internally)
-  DEVICE_ID            Camera serial number (e.g. "5372540233101051")
+  DEVICE_ID            Camera serial number (e.g. "5372540233101051"). Optional — defaults to first device on the account.
   RTSP_OUTPUT          Full RTSP push URL. If unset, built from RTSP_HOST + RTSP_PATH.
   RTSP_HOST            RTSP server host:port (default: localhost:8554) — used only if RTSP_OUTPUT is unset.
   RTSP_PATH            RTSP stream path (default: birdfy) — used only if RTSP_OUTPUT is unset.
@@ -55,7 +55,7 @@ logger = logging.getLogger("main")
 
 BIRDFY_EMAIL    = os.environ["BIRDFY_EMAIL"]
 BIRDFY_PASSWORD = os.environ["BIRDFY_PASSWORD"]
-DEVICE_ID       = os.environ["DEVICE_ID"]
+DEVICE_ID       = os.getenv("DEVICE_ID", "")
 RTSP_OUTPUT     = os.getenv("RTSP_OUTPUT") or (
     f"rtsp://{os.getenv('RTSP_HOST', 'localhost:8554')}/{os.getenv('RTSP_PATH', 'birdfy')}"
 )
@@ -74,17 +74,23 @@ async def run_once():
     devices = await get_devices(auth_data)
 
     target = None
-    for device in devices:
-        if device.get("serialNumber") == DEVICE_ID or device.get("addxSn") == DEVICE_ID:
-            target = device
-            break
+    if DEVICE_ID:
+        for device in devices:
+            if device.get("serialNumber") == DEVICE_ID or device.get("addxSn") == DEVICE_ID:
+                target = device
+                break
 
     if target is None:
-        available = [f"{d.get('serialNumber')} / addxSn={d.get('addxSn')} ({d.get('deviceName')})" for d in devices]
-        raise RuntimeError(
-            f"Device {DEVICE_ID!r} not found. Available devices: {available}\n"
-            "Set DEVICE_ID to one of the serial numbers above."
-        )
+        if DEVICE_ID:
+            available = [f"{d.get('serialNumber')} / addxSn={d.get('addxSn')} ({d.get('deviceName')})" for d in devices]
+            logger.warning(
+                f"Device {DEVICE_ID!r} not found — falling back to first device. "
+                f"Available: {available}"
+            )
+        if not devices:
+            raise RuntimeError("No devices found on this account.")
+        target = devices[0]
+        logger.info(f"Using device: {target.get('deviceName')!r} sn={target.get('serialNumber')}")
 
     logger.info(
         f"Device found: {target.get('deviceName')!r} sn={target['serialNumber']} "
