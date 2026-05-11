@@ -3,6 +3,9 @@
 # that may move between minor versions.
 aiortc>=1.11.0,<2.0
 aiohttp>=3.9.0,<4.0
+# websockets API shifted at 14.0: the legacy module (which we use via
+# websockets.connect) accepts `extra_headers`, while the new asyncio module
+# renamed it to `additional_headers`. We use `extra_headers`, so stay on 13.x.
 websockets>=12.0,<14.0
 av>=14.0.0,<17.0.0
 numpy>=1.26.0,<3.0

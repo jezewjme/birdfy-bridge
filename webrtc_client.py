@@ -474,6 +474,14 @@ async def connect_and_stream(
                         )
                         answer_received.set()
                         logger.info("Remote SDP set (SDP_ANSWER received)")
+                        # Log a one-line summary of negotiated video codec so we can
+                        # see profile-level-id, packetization-mode, and whether the
+                        # camera ships sprop-parameter-sets in-band. Useful for
+                        # debugging decode failures.
+                        for line in sdp.splitlines():
+                            ls = line.strip()
+                            if ls.startswith("a=rtpmap:") or ls.startswith("a=fmtp:"):
+                                logger.info(f"SDP_ANSWER negotiated: {ls}")
 
                 # ICE candidate from camera
                 elif msg_type in ("ICE_CANDIDATE", "candidate", "iceCandidate"):
