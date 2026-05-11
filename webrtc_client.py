@@ -39,6 +39,7 @@ from aiortc.sdp import candidate_from_sdp
 # Side-effect import: installs aioice monkey-patches required for the Addx
 # camera's STUN/ICE quirks. See _aioice_patches.py for what each patch does.
 import _aioice_patches  # noqa: F401
+from _rtp_forwarder import forward_video
 from _sdp_patches import apply_offer_patches, extract_trickle_candidates
 
 logger = logging.getLogger(__name__)
@@ -252,7 +253,27 @@ async def connect_and_stream(
     def on_track(track):
         logger.info(f"Track received: kind={track.kind}")
         if track.kind == "video":
-            asyncio.ensure_future(_stream_video(track, rtsp_output, ffmpeg_state, pc))
+            # RTP passthrough: hook the video receiver's jitter buffer and pipe
+            # depayloaded H264 directly to ffmpeg -c copy. Bypasses aiortc's
+            # broken libavcodec decoder for this camera's bitstream.
+            receiver = next(
+                (t.receiver for t in pc.getTransceivers()
+                 if t.kind == "video" and t.receiver is not None),
+                None,
+            )
+            if receiver is None:
+                logger.error("Video track received but no video receiver found — falling back to decode path")
+                asyncio.ensure_future(_stream_video(track, rtsp_output, ffmpeg_state, pc))
+            else:
+                # Keep aiortc's track-drain loop running too, otherwise the
+                # decoder thread's output queue backs up and may block the
+                # decoder worker. _drain() is a no-op consumer.
+                asyncio.ensure_future(_drain(track))
+                asyncio.ensure_future(
+                    forward_video(receiver, rtsp_output, frame_timeout=FRAME_TIMEOUT)
+                )
+                # Still nudge the camera for an early keyframe.
+                asyncio.ensure_future(_pli_nudger(pc))
         else:
             asyncio.ensure_future(_drain(track))
 
