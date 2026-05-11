@@ -1,0 +1,23 @@
+# Minimal MediaMTX config for birdfy-bridge.
+# Accepts publishes from the in-container bridge (ffmpeg pushing to localhost:8554)
+# and serves reads to anything on the container network (VLC, Frigate, etc.).
+# No auth — homelab use. Lock down with publishUser/publishPass if exposing wider.
+
+logLevel: info
+logDestinations: [stdout]
+
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+# Disable protocols we don't need.
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+
+# Default path config: anyone on the container network can publish or read.
+pathDefaults:
+  source: publisher
+
+paths:
+  all_others:

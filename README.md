@@ -73,25 +73,32 @@ x-nvs-version:   {"signature":2}
 | `BIRDFY_EMAIL`  | Yes      | Netvue/Birdfy account email |
 | `BIRDFY_PASSWORD` | Yes    | Account password (plain text, MD5'd internally) |
 | `DEVICE_ID`     | Yes      | Camera serial number (e.g. `5372540233101051`) — shown on device list startup log |
-| `RTSP_OUTPUT`   | No       | RTSP push URL (default: `rtsp://frigate:8554/birdfy`) |
+| `RTSP_OUTPUT`   | No       | Full RTSP push URL. If unset, built from `RTSP_HOST` + `RTSP_PATH`. |
+| `RTSP_HOST`     | No       | RTSP server host:port (default: `localhost:8554` — the bundled MediaMTX) |
+| `RTSP_PATH`     | No       | RTSP stream path (default: `birdfy`) |
 | `LOG_LEVEL`     | No       | `DEBUG` / `INFO` / `WARNING` (default: `INFO`) |
+| `LOG_FILE`      | No       | Path for file log (default: `birdfy-bridge.log`; empty = stdout only) |
 | `NVS_UCID`      | No       | App client ID (default: `513774810c`) |
 | `NVS_UDID`      | No       | Stable device UUID for signing (auto-generated per run if not set) |
 
-## Running with Docker Compose
+## Running with Docker
 
-```yaml
-services:
-  birdfy-bridge:
-    build: ./birdfy-bridge
-    restart: unless-stopped
-    environment:
-      BIRDFY_EMAIL: your@email.com
-      BIRDFY_PASSWORD: yourpassword
-      DEVICE_ID: "5372540233101051"
-      RTSP_OUTPUT: rtsp://go2rtc:8554/birdfy
-      LOG_LEVEL: INFO
+The container bundles [MediaMTX](https://github.com/bluenviron/mediamtx) as an RTSP server so it works standalone: the bridge publishes to MediaMTX inside the container, and consumers (VLC, Frigate) read the stream from the container's exposed port 8554.
+
+```bash
+cp .env.example .env
+# edit .env with your BIRDFY_EMAIL, BIRDFY_PASSWORD, DEVICE_ID
+docker compose up --build -d
+docker compose logs -f
 ```
+
+Then point a player at `rtsp://<docker-host>:8554/birdfy` (VLC: Media → Open Network Stream).
+
+### Pointing Frigate at the bridge
+
+If Frigate runs on the same Docker network, set its camera input to `rtsp://birdfy-bridge:8554/birdfy`. From another host, use `rtsp://<host-running-birdfy-bridge>:8554/birdfy`.
+
+You can also bypass the bundled MediaMTX entirely and publish straight to Frigate's go2rtc by setting `RTSP_OUTPUT=rtsp://frigate:8554/birdfy` in `.env` — in that case the container's MediaMTX still runs but nothing publishes to it.
 
 ## Finding your DEVICE_ID
 
@@ -100,18 +107,22 @@ Set `LOG_LEVEL=DEBUG` and look for the "Device found" log lines at startup. The 
 ## What's broken / not done
 
 - **KVS path**: `onAddx: false` devices (some outdoor cameras) need a separate boto3-based implementation — currently raises `NotImplementedError`
-- **WebSocket message format**: The `recipientClientId` for Addx is unclear — may need to be the `addxSn` field, empty string, or something from the ticket. This is the most likely cause of connection issues during initial testing
-- **SDP offer timing**: We may need to wait for a "peer in" message from the server before sending the SDP offer. The Addx client JS sends the offer only after `onRemotePeerIn` fires
-- **Data channel**: The `startLive` data channel message is sent on `onDataChannelOpen` — the device may require this before sending video
+- **Initial keyframe latency**: After the data channel opens, the camera takes ~15s to send a decodable keyframe. Sending an RTCP PLI immediately after `startLive` would shorten this
 - **Token refresh**: The `token` field has an expiry. Production use needs the `/auth/refreshtoken` endpoint
+- **Audio**: Audio track is received but not currently muxed into the RTSP output (video-only)
 
 ## Dependencies
 
+### Python (requirements.txt)
 - `aiortc` — WebRTC library (handles SDP, ICE, H264 decode)
 - `aiohttp` — async HTTP for API calls
 - `websockets` — WebSocket client for signaling
 - `av`, `numpy` — video frame handling
-- `ffmpeg` (system binary) — re-encode and push RTSP
+
+### System (Docker image installs these)
+- `ffmpeg` — re-encode H264 + push RTSP
+- `mediamtx` — bundled RTSP server (latest release fetched at build time)
+- `s6-overlay` — process supervisor for running mediamtx + bridge together
 
 ## Debugging
 

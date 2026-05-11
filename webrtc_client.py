@@ -422,9 +422,8 @@ async def connect_and_stream(
     _pre_offer = await pc.createOffer()
     await pc.setLocalDescription(_pre_offer)
     _pre_sdp = pc.localDescription.sdp
-    # Reverted SDP shape changes (sctpmap removal + ice-options:trickle + max-message-size
-    # bump) on 2026-05-10: applying all three at once caused the camera to STOP returning
-    # SDP_ANSWER (12s timeout). Restoring last-known-working SDP. See HANDOFF.md / prompt.md.
+    # Camera's SDP parser requires an explicit a=sctpmap line alongside a=sctp-port;
+    # without it SDP_ANSWER never returns.
     if "a=sctp-port:5000" in _pre_sdp and "a=sctpmap:5000" not in _pre_sdp:
         _pre_sdp = _pre_sdp.replace(
             "a=sctp-port:5000\r\n",
@@ -432,24 +431,16 @@ async def connect_and_stream(
         )
         logger.info("SDP patched: injected a=sctpmap:5000 for camera compat")
 
-    # Cap SCTP OS/MIS to 1024 to match Chrome/Edge's usrsctp defaults.
-    # aiortc hardcodes both to MAX_STREAMS=65535. Wireshark comparison of our INIT
-    # vs Edge's INIT (Birdify with Edge connecting successfully.pcapng, frame ~4786)
-    # shows identical chunk layout and size — the only sanity-checkable difference
-    # is OS/MIS. The Hisilicon/Tuya SCTP stack on this camera silently drops INITs
-    # with 64x more streams than its allocator can serve, which matches what we see:
-    # INIT goes out, camera ignores it, we retransmit forever.
+    # Match Chrome/Edge usrsctp defaults (1024 streams) instead of aiortc's 65535.
     if pc.sctp is not None:
         pc.sctp._outbound_streams_count = 1024
         pc.sctp._inbound_streams_max = 1024
         logger.info("SCTP: capped OS/MIS to 1024 to match Chrome/Edge")
 
-    # Strip sha-384 / sha-512 DTLS fingerprints. Chrome/Edge send only sha-256.
-    # aiortc emits all three per m-section. A stricter remote SDP parser that picks
-    # the LAST fingerprint line (sha-512) would compute a different DTLS cert hash
-    # than what the camera actually saw during the handshake — handshake still
-    # succeeds (we never check), but every post-handshake payload (incl. SCTP INIT)
-    # could be silently dropped. Matches what we observe: DTLS OK, INIT ignored.
+    # Strip non-sha-256 DTLS fingerprints. Camera's SDP parser picks a non-sha-256
+    # line whose hash won't match the cert observed during the handshake; DTLS still
+    # completes (it doesn't verify) but every record afterwards is silently dropped,
+    # including the SCTP INIT. Browsers ship only sha-256, so do the same.
     _sdp_lines = _pre_sdp.split("\r\n")
     _filtered = [ln for ln in _sdp_lines if not ln.startswith("a=fingerprint:sha-384")
                  and not ln.startswith("a=fingerprint:sha-512")]

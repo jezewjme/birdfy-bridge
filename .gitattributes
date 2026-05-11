@@ -1,0 +1,6 @@
+# s6-overlay service scripts MUST be LF — execlineb won't find its interpreter
+# if the shebang line has CRLF. Same applies to mediamtx.yml (parsed by Go) and
+# any shell scripts shipped to the Linux container.
+docker/** text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf

@@ -16,7 +16,9 @@ Environment variables:
   BIRDFY_EMAIL         Netvue/Birdfy account email
   BIRDFY_PASSWORD      Netvue/Birdfy account password (plain text; MD5'd internally)
   DEVICE_ID            Camera serial number (e.g. "5372540233101051")
-  RTSP_OUTPUT          RTSP push URL (default: rtsp://frigate:8554/birdfy)
+  RTSP_OUTPUT          Full RTSP push URL. If unset, built from RTSP_HOST + RTSP_PATH.
+  RTSP_HOST            RTSP server host:port (default: localhost:8554) — used only if RTSP_OUTPUT is unset.
+  RTSP_PATH            RTSP stream path (default: birdfy) — used only if RTSP_OUTPUT is unset.
   LOG_LEVEL            DEBUG / INFO / WARNING (default: INFO)
   LOG_FILE             Path to file for logging output (default: birdfy-bridge.log)
 
@@ -54,7 +56,9 @@ logger = logging.getLogger("main")
 BIRDFY_EMAIL    = os.environ["BIRDFY_EMAIL"]
 BIRDFY_PASSWORD = os.environ["BIRDFY_PASSWORD"]
 DEVICE_ID       = os.environ["DEVICE_ID"]
-RTSP_OUTPUT     = os.getenv("RTSP_OUTPUT", "rtsp://frigate:8554/birdfy")
+RTSP_OUTPUT     = os.getenv("RTSP_OUTPUT") or (
+    f"rtsp://{os.getenv('RTSP_HOST', 'localhost:8554')}/{os.getenv('RTSP_PATH', 'birdfy')}"
+)
 
 
 async def run_once():
