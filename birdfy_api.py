@@ -234,7 +234,13 @@ _APP_OBJECT = {
 }
 
 
-async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_region: str | None = None) -> dict:
+async def get_addx_ticket(
+    auth_data: dict,
+    device: dict | None = None,
+    device_region: str | None = None,
+    *,
+    addx_state: dict | None = None,
+) -> dict:
     """
     Get the Addx WebRTC signaling ticket for onAddx=True devices.
 
@@ -249,6 +255,9 @@ async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_re
          -> returns {signalServer, groupId, role, id, traceId, time, sign, iceServer, ...}
 
     WebSocket URL: {signalServer}/{groupId}/{role}/{id}?traceId=...&time=...&sign=...&name=a4x
+
+    addx_state (in/out): if provided, the addx token + endpoint + language are stored
+    here on first call and reused by callers who later need them (e.g. select/stop).
     """
     login_token = auth_data.get("token", "")
     addx_sn = (device or {}).get("addxSn") or (device or {}).get("serialNumber", "")
@@ -343,81 +352,115 @@ async def get_addx_ticket(auth_data: dict, device: dict | None = None, device_re
                 f"id={ticket.get('id')}"
             )
 
-        # Stash addx state on the ticket so callers can fire start_live later
-        # (after ICE completes — see webrtc_client.connect_and_stream).
-        # Calling startlive at ticket-fetch time triggers result=-3021 DEVICE_NO_RESPONSE
-        # because the camera's WebRTC stack isn't yet listening for the cloud trigger.
+        # Stash addx state on the ticket so callers can issue subsequent
+        # selectsingledevice / stoplive / new-ticket calls without re-deriving
+        # endpoint/token/serial.
         ticket["_addx_endpoint"] = addx_endpoint
         ticket["_addx_token"] = addx_token
         ticket["_addx_sn"] = addx_sn
         ticket["_language"] = language
         ticket["_country_no"] = country_no
+        ticket["_region"] = region
+
+        if addx_state is not None:
+            for key in ("_addx_endpoint", "_addx_token", "_addx_sn", "_language", "_country_no", "_region"):
+                addx_state[key] = ticket[key]
 
         return ticket
 
 
-async def start_live(ticket: dict) -> bool:
+async def select_single_device(ticket: dict) -> bool:
     """
-    Tell the camera to start its live stream session.
+    POST {endpoint}device/selectsingledevice — first call the browser makes
+    after addx-token/before getWebrtcTicket. Appears to "wake" the camera's
+    cloud subscription so the subsequent WebRTC handshake can complete.
 
-    Call this AFTER WebRTC ICE has reached "completed" — the camera's WebRTC stack
-    needs to be ready to bind the cloud's startLive command to the active session.
-    Calling earlier returns result=-3021 DEVICE_NO_RESPONSE.
+    Pulls endpoint/token/serial/language from the ticket dict (or any compatible
+    state dict with the _addx_* keys).
 
-    Pulls all needed state (endpoint, token, serial, locale) from the ticket dict
-    populated by get_addx_ticket.
-
-    connectionId format (from web app JS): "<groupId>:<role>:<id>:"":<epoch_ms/100>"
-    The literal `""` field is suspect — pending web-app sniff to confirm.
-
-    Returns True if cloud accepted (result=0), False otherwise.
+    Returns True if cloud returned 200, False otherwise (best-effort: never raises).
     """
     endpoint = ticket["_addx_endpoint"]
     addx_token = ticket["_addx_token"]
     addx_sn = ticket["_addx_sn"]
     language = ticket["_language"]
-    country_no = ticket["_country_no"]
-    ts_ms = int(time.time() * 1000)
-    group_id = ticket.get("groupId", "")
-    role = ticket.get("role", "viewer")
-    client_id = str(ticket.get("id", ""))
-    connection_id = f'{group_id}:{role}:{client_id}:"":{ts_ms // 100}'
+    country_no = (ticket.get("_country_no") or "").upper()
 
     body = {
-        "requestId": uuid.uuid4().hex,
-        "language": language,
-        "countryNo": country_no.upper(),
-        "app": _APP_OBJECT,
         "serialNumber": addx_sn,
-        "timestamp": ts_ms,
-        "connectionId": connection_id,
-        "size": "auto",
-        "action": "startLive",
+        "app": _APP_OBJECT,
+        "language": language,
+        "countryNo": country_no,
+        "requestId": str(uuid.uuid4()),
+    }
+    region = ticket.get("_region") or ""
+    headers = {
+        "Authorization": addx_token,
+        "Content-Type": "application/json",
+        "User-Agent": "NeWing/5.0 (web)",
+    }
+    if region:
+        headers["x-nvs-a4x-region"] = region
+
+    url = f"{endpoint}device/selectsingledevice"
+    logger.info(f"SELECT DEVICE -> {url} sn={addx_sn}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                text = await resp.text()
+                logger.debug(f"  HTTP {resp.status}: {text[:400]}")
+                if resp.status != 200:
+                    logger.warning(f"selectsingledevice HTTP {resp.status}: {text[:200]}")
+                    return False
+                logger.info("selectsingledevice OK")
+                return True
+    except Exception as e:
+        logger.warning(f"selectsingledevice call failed: {e}")
+        return False
+
+
+async def stop_live(ticket: dict) -> bool:
+    """
+    POST {endpoint}device/stoplive — the browser calls this between a failed
+    WebRTC attempt and a fresh getWebrtcTicket. Tells the cloud to drop any
+    half-open session so the camera will accept the next handshake.
+    Best-effort; never raises.
+    """
+    endpoint = ticket["_addx_endpoint"]
+    addx_token = ticket["_addx_token"]
+    addx_sn = ticket["_addx_sn"]
+    language = ticket["_language"]
+    country_no = (ticket.get("_country_no") or "").upper()
+
+    body = {
+        "serialNumber": addx_sn,
+        "app": _APP_OBJECT,
+        "language": language,
+        "countryNo": country_no,
+        "requestId": str(uuid.uuid4()),
     }
     headers = {
         "Authorization": addx_token,
         "Content-Type": "application/json",
         "User-Agent": "NeWing/5.0 (web)",
     }
-    url = f"{endpoint}device/startlive"
-    logger.info(f"START LIVE -> {url} connectionId={connection_id}")
+    url = f"{endpoint}device/stoplive"
+    logger.info(f"STOP LIVE -> {url} sn={addx_sn}")
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(
+                url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
                 text = await resp.text()
                 logger.debug(f"  HTTP {resp.status}: {text[:400]}")
                 if resp.status != 200:
-                    logger.warning(f"startlive HTTP {resp.status}: {text[:200]}")
+                    logger.warning(f"stoplive HTTP {resp.status}: {text[:200]}")
                     return False
-                result_body = json.loads(text)
-                result_code = (result_body.get("data") or result_body).get("result", result_body.get("code", 0))
-                if result_code != 0:
-                    logger.warning(f"startlive result={result_code}: {text[:200]}")
-                    return False
-                logger.info("startlive OK — camera should begin pushing RTP")
                 return True
     except Exception as e:
-        logger.warning(f"startlive call failed: {e}")
+        logger.warning(f"stoplive call failed: {e}")
         return False
 
 

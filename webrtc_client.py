@@ -26,6 +26,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import subprocess
 import tempfile
 import uuid
@@ -34,7 +35,6 @@ import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCBundlePolicy
 
-from birdfy_api import start_live
 from aiortc.sdp import candidate_from_sdp
 import aioice.ice
 import aioice.stun as stun
@@ -141,8 +141,34 @@ aioice.ice.Connection.request_received = _patched_request_received
 # with a Fatal/Unexpected Message alert.
 # --------------------------------------------
 
+# SCTP role: aiortc default (is_server=False, SCTP client, sends INIT first).
+#
+# Earlier this code was patched to is_server=True based on bad guidance ("Chrome
+# is SCTP server"). Wireshark capture of the actual successful Edge handshake
+# (Birdify with Edge connecting successfully.pcapng) shows the OPPOSITE:
+# immediately after DTLS, the BROWSER sends DTLS Application Data (SCTP INIT)
+# and the camera responds with INIT-ACK. Without this, both sides sit waiting
+# and the camera never starts media — confirmed by 5-10-26 bridge connect.pcapng
+# where the camera goes silent (just STUN keepalives) post-DTLS.
+#
+# Keeping aiortc's default behavior here on purpose; do not re-add the patch.
+
 # How long to wait between frames before declaring the track dead
 FRAME_TIMEOUT = 30
+DATA_CHANNEL_LABEL = os.getenv("BIRDFY_DC_LABEL", "webDataChannel")
+DATA_CHANNEL_PROTOCOL = os.getenv("BIRDFY_DC_PROTOCOL", "")
+_default_payloads = [
+    '{"action":"startLive","resolution":"auto"}',
+    '{"action":"startLive"}',
+    '{"action":"startlive","resolution":"auto"}',
+    '{"action":"startlive"}',
+    "startLive",
+]
+DATA_CHANNEL_PAYLOADS = [
+    p.strip()
+    for p in os.getenv("BIRDFY_DC_PAYLOADS", "|".join(_default_payloads)).split("|")
+    if p.strip()
+]
 
 
 def _build_ws_url(ticket: dict) -> str:
@@ -214,24 +240,64 @@ def _sdp_offer_msg(sdp: str, recipient_id: str, sender_id: str, session_id: str)
     }
 
 
-def _ice_candidate_msg(candidate, recipient_id: str, sender_id: str, session_id: str) -> dict:
-    """Build the ICE_CANDIDATE WebSocket message."""
-    # candidate is an aiortc RTCIceCandidate
-    cand_dict = {
-        "candidate": f"candidate:{candidate.foundation} {candidate.component} "
-                     f"{candidate.protocol} {candidate.priority} "
-                     f"{candidate.ip} {candidate.port} typ {candidate.type}",
-        "sdpMid": candidate.sdpMid or "0",
-        "sdpMLineIndex": candidate.sdpMLineIndex or 0,
+def _ice_candidate_msg(
+    candidate_line: str,
+    sdp_mid: str,
+    sdp_mline_index: int,
+    ufrag: str,
+    recipient_id: str,
+    sender_id: str,
+    session_id: str,
+) -> dict:
+    """Build an ICE_CANDIDATE WebSocket message matching the browser's shape."""
+    payload = {
+        "candidate": candidate_line,
+        "sdpMid": sdp_mid,
+        "sdpMLineIndex": sdp_mline_index,
+        "usernameFragment": ufrag,
     }
     return {
         "messageType": "ICE_CANDIDATE",
         "recipientClientId": recipient_id,
         "senderClientId": sender_id,
         "sessionId": session_id,
-        "messagePayload": _b64_encode(cand_dict),
+        "messagePayload": _b64_encode(payload),
         "mode": "vicoo",
     }
+
+
+def _extract_candidates_from_sdp(sdp: str) -> list[dict]:
+    """Parse a=candidate: lines out of an SDP and group them by m-line.
+
+    Returns one dict per candidate: {candidate, sdpMid, sdpMLineIndex, ufrag}.
+    With MAX_BUNDLE the same candidates appear under each m=, but the browser
+    only trickles candidates with sdpMLineIndex=0 (mid="0"), so we mirror that.
+    """
+    out: list[dict] = []
+    sdp_mline = -1
+    sdp_mid = "0"
+    ufrag = ""
+    for raw_line in sdp.splitlines():
+        line = raw_line.strip()
+        if line.startswith("m="):
+            sdp_mline += 1
+            # mid will follow in the same m-section; reset
+            sdp_mid = str(sdp_mline)
+        elif line.startswith("a=mid:"):
+            sdp_mid = line[len("a=mid:"):].strip()
+        elif line.startswith("a=ice-ufrag:"):
+            ufrag = line[len("a=ice-ufrag:"):].strip()
+        elif line.startswith("a=candidate:") and sdp_mline == 0:
+            cand_no_prefix = line[len("a="):]  # "candidate:..."
+            out.append({
+                "candidate": cand_no_prefix,
+                "sdpMid": sdp_mid,
+                "sdpMLineIndex": 0,
+                "ufrag": ufrag,
+            })
+    return out
+
+
 
 
 async def connect_and_stream(
@@ -255,8 +321,11 @@ async def connect_and_stream(
 
     # Tell aiortc we want to receive video (and audio if camera sends it).
     # Without this the SDP offer has no m= lines and the server drops the connection.
-    pc.addTransceiver("video", direction="recvonly")
+    # Order matters: browser HAR shows audio m-line FIRST, then video, then
+    # application. Camera SDP_ANSWER mirrors that order. aiortc emits m-lines in
+    # addTransceiver order, so we add audio first to match the browser.
     pc.addTransceiver("audio", direction="recvonly")
+    pc.addTransceiver("video", direction="recvonly")
 
     # Create a data channel BEFORE the offer so the SDP includes an m=application
     # section. The camera receives the startLive trigger over this channel — not via
@@ -264,17 +333,38 @@ async def connect_and_stream(
     # despite the cloud accepting the auth). Confirmed by sniffing my.birdfy.com:
     # the webapp sends DTLS Application Data (SCTP-over-DTLS) immediately after the
     # handshake, then bulk SRTP follows.
-    control_channel = pc.createDataChannel("a4xControl")
+    # Mirror Chrome behavior observed on my.birdfy.com:
+    # label=webDataChannel with default negotiated=False and auto-assigned stream id.
+    control_channel = pc.createDataChannel(
+        DATA_CHANNEL_LABEL,
+        protocol=DATA_CHANNEL_PROTOCOL,
+    )
 
     @control_channel.on("open")
     def _control_open():
-        msg = json.dumps({"action": "startLive", "resolution": "auto"})
-        logger.info(f"Control channel open — sending startLive: {msg}")
-        control_channel.send(msg)
+        logger.info(
+            "Control channel open: label=%s protocol=%r id=%s ordered=%s negotiated=%s",
+            control_channel.label,
+            control_channel.protocol,
+            control_channel.id,
+            control_channel.ordered,
+            control_channel.negotiated,
+        )
+        for idx, msg in enumerate(DATA_CHANNEL_PAYLOADS, start=1):
+            try:
+                logger.info(
+                    "Control channel send [%s/%s]: %s",
+                    idx,
+                    len(DATA_CHANNEL_PAYLOADS),
+                    msg,
+                )
+                control_channel.send(msg)
+            except Exception as e:
+                logger.warning(f"Control channel send failed for payload {idx}: {e}")
 
     @control_channel.on("message")
     def _control_msg(m):
-        logger.info(f"Control channel msg: {m!r}")
+        logger.info(f"Control channel msg ({type(m).__name__}): {m!r}")
 
     # IDs for signaling messages.
     # sender_id must match ticket["id"] — that is how the signaling server identifies us.
@@ -309,24 +399,52 @@ async def connect_and_stream(
 
     @pc.on("connectionstatechange")
     async def _state():
-        logger.info(f"WebRTC state -> {pc.connectionState}")
-
-    # Fire startlive ONCE when ICE reaches "completed". Calling earlier (during
-    # ticket setup) returns -3021 DEVICE_NO_RESPONSE because the camera's WebRTC
-    # stack isn't yet bound to the cloud session. Without a successful startlive
-    # the camera completes WebRTC + DTLS but never pushes RTP.
-    startlive_fired = {"v": False}
+        sctp_transport = pc.sctp.transport.state if pc.sctp and pc.sctp.transport else "n/a"
+        sctp_port = pc.sctp.port if pc.sctp else "n/a"
+        logger.info(
+            "WebRTC state -> %s (sctp_port=%s dtls=%s)",
+            pc.connectionState,
+            sctp_port,
+            sctp_transport,
+        )
 
     @pc.on("iceconnectionstatechange")
     async def _ice_state():
         logger.info(f"ICE state -> {pc.iceConnectionState}")
-        if pc.iceConnectionState == "completed" and not startlive_fired["v"]:
-            startlive_fired["v"] = True
-            await start_live(ticket)
+
+    # Create the SDP offer before opening the WebSocket so it's ready to fire
+    # the instant PEER_IN arrives (camera times out in ~5s).
+    # The camera DOES need our ICE candidates trickled over the WebSocket — the
+    # browser HAR shows ~22 ICE_CANDIDATE messages sent right after SDP_OFFER,
+    # then the local-host candidate re-sent every ~2s as a heartbeat. Without
+    # these the camera's STUN pair stays IN_PROGRESS forever and never nominates.
+    logger.info("Creating SDP offer ...")
+    _pre_offer = await pc.createOffer()
+    await pc.setLocalDescription(_pre_offer)
+    _pre_sdp = pc.localDescription.sdp
+    # Reverted SDP shape changes (sctpmap removal + ice-options:trickle + max-message-size
+    # bump) on 2026-05-10: applying all three at once caused the camera to STOP returning
+    # SDP_ANSWER (12s timeout). Restoring last-known-working SDP. See HANDOFF.md / prompt.md.
+    if "a=sctp-port:5000" in _pre_sdp and "a=sctpmap:5000" not in _pre_sdp:
+        _pre_sdp = _pre_sdp.replace(
+            "a=sctp-port:5000\r\n",
+            "a=sctp-port:5000\r\na=sctpmap:5000 webrtc-datachannel 1024\r\n",
+        )
+        logger.info("SDP patched: injected a=sctpmap:5000 for camera compat")
+    _gathered_candidates = _extract_candidates_from_sdp(_pre_sdp)
+    _host_candidate = next(
+        (c for c in _gathered_candidates if " typ host" in c["candidate"]),
+        _gathered_candidates[0] if _gathered_candidates else None,
+    )
+    logger.info(
+        f"Gathered {len(_gathered_candidates)} ICE candidates to trickle "
+        f"(host heartbeat: {'yes' if _host_candidate else 'no'})"
+    )
+    logger.info("Connecting to WebSocket ...")
 
     url = _build_ws_url(ticket)
     ping_interval = ticket.get("signalPingInterval", 2)
-    cached_candidate_str: list = [None]  # mutable container
+    heartbeat_task: asyncio.Task | None = None
 
     try:
         async with websockets.connect(
@@ -342,12 +460,43 @@ async def connect_and_stream(
             master_id: list = [recipient_id]  # default; overwritten on PEER_IN
             offer_sent = asyncio.Event()
             connected = asyncio.Event()
+            peer_in_received = asyncio.Event()
+            answer_received = asyncio.Event()
+
+            async def _peer_in_watchdog():
+                try:
+                    await asyncio.wait_for(peer_in_received.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "No PEER_IN from camera after 30s — camera may be offline or rebooting. "
+                        "Will keep waiting but connection is unlikely."
+                    )
+
+            async def _answer_watchdog():
+                # The camera should answer within a few seconds. Browser HAR shows the
+                # first WS attempt waits ~16s with no answer, then PEER_OUT, then a
+                # full reconnect with a new ticket. We mirror that: give it 12s, then
+                # close the WS so main() loops with a fresh ticket.
+                try:
+                    await asyncio.wait_for(answer_received.wait(), timeout=12)
+                except asyncio.TimeoutError:
+                    logger.warning("No SDP_ANSWER within 12s — closing WS to retry with fresh ticket")
+                    await ws.close()
+
+            def _make_candidate_msg(cand: dict) -> dict:
+                return _ice_candidate_msg(
+                    candidate_line=cand["candidate"],
+                    sdp_mid=cand["sdpMid"],
+                    sdp_mline_index=cand["sdpMLineIndex"],
+                    ufrag=cand["ufrag"],
+                    recipient_id=master_id[0],
+                    sender_id=sender_id,
+                    session_id=session_id,
+                )
 
             async def _send_offer():
-                offer = await pc.createOffer()
-                await pc.setLocalDescription(offer)
                 offer_msg = _sdp_offer_msg(
-                    sdp=pc.localDescription.sdp,
+                    sdp=_pre_sdp,
                     recipient_id=master_id[0],
                     sender_id=sender_id,
                     session_id=session_id,
@@ -355,16 +504,38 @@ async def connect_and_stream(
                 logger.debug(f"Sending SDP_OFFER to {master_id[0]} (first 300): {json.dumps(offer_msg)[:300]}")
                 await ws.send(json.dumps(offer_msg))
                 offer_sent.set()
+                logger.debug("SDP offer sent")
 
-            # Set up ICE candidate handler (queues until offer is sent)
-            @pc.on("icecandidate")
-            async def on_ice_candidate(candidate):
-                if candidate and ws.close_code is None:
-                    await offer_sent.wait()  # don't send ICE before offer
-                    msg = _ice_candidate_msg(candidate, master_id[0], sender_id, session_id)
-                    cached_candidate_str[0] = json.dumps(msg)
-                    await ws.send(cached_candidate_str[0])
-                    logger.debug(f"Sent ICE candidate: {str(candidate)[:80]}")
+                # Browser sends all gathered candidates as separate ICE_CANDIDATE
+                # messages right after SDP_OFFER. The camera apparently requires
+                # this to nominate its STUN pair.
+                for cand in _gathered_candidates:
+                    try:
+                        await ws.send(json.dumps(_make_candidate_msg(cand)))
+                    except Exception as e:
+                        logger.warning(f"ICE candidate send failed (non-fatal): {e}")
+                logger.info(f"Trickled {len(_gathered_candidates)} ICE candidates over WS")
+
+            async def _ice_heartbeat():
+                # Browser re-sends the local-host candidate every ~signalPingInterval
+                # seconds for the lifetime of the WS. Skip if no host candidate is
+                # available (then the burst alone is the best we can do).
+                if not _host_candidate:
+                    return
+                interval = max(1.0, float(ticket.get("signalPingInterval", 2)))
+                try:
+                    while True:
+                        await asyncio.sleep(interval)
+                        try:
+                            await ws.send(json.dumps(_make_candidate_msg(_host_candidate)))
+                        except Exception:
+                            return
+                except asyncio.CancelledError:
+                    return
+
+            asyncio.ensure_future(_peer_in_watchdog())
+            asyncio.ensure_future(_answer_watchdog())
+            heartbeat_task = asyncio.ensure_future(_ice_heartbeat())
 
             async for raw in ws:
                 try:
@@ -376,17 +547,26 @@ async def connect_and_stream(
                 msg_type = msg.get("messageType") or msg.get("type") or msg.get("signal") or ""
                 logger.debug(f"WS [{msg_type}]: {raw[:300]}")
 
-                # Camera announces itself — send our SDP offer in response
-                if msg_type == "PEER_IN" and not offer_sent.is_set():
+                # Camera announces itself — send our SDP offer on the first PEER_IN.
+                # The camera may send a second PEER_IN later in the handshake; the
+                # browser HAR shows it just keeps trickling ICE through it, so we do
+                # the same. Recovery from a broken handshake is driven by PEER_OUT
+                # or by the SDP_ANSWER timeout in main(), not by counting PEER_INs.
+                if msg_type == "PEER_IN":
                     payload_b64 = msg.get("messagePayload", "")
                     try:
                         peer_info = json.loads(base64.b64decode(payload_b64).decode())
                         if peer_info.get("role") == "master":
                             master_id[0] = msg.get("senderClientId") or peer_info.get("id") or master_id[0]
-                            logger.info(f"PEER_IN from master {master_id[0]} — sending SDP offer")
                     except Exception:
-                        logger.info(f"PEER_IN received — sending SDP offer")
-                    asyncio.ensure_future(_send_offer())
+                        pass
+
+                    if not offer_sent.is_set():
+                        peer_in_received.set()
+                        logger.info(f"PEER_IN from master {master_id[0]} — sending SDP offer")
+                        asyncio.ensure_future(_send_offer())
+                    else:
+                        logger.debug("Subsequent PEER_IN — ignoring (handshake already in progress)")
 
                 # SDP answer from camera
                 elif msg_type in ("SDP_ANSWER", "sdp", "answer") or msg.get("type") == "answer":
@@ -412,12 +592,16 @@ async def connect_and_stream(
                         await pc.setRemoteDescription(
                             RTCSessionDescription(sdp=sdp, type="answer")
                         )
+                        answer_received.set()
                         logger.info("Remote SDP set (SDP_ANSWER received)")
 
                 # ICE candidate from camera
                 elif msg_type in ("ICE_CANDIDATE", "candidate", "iceCandidate"):
                     payload = msg.get("messagePayload") or msg.get("body") or msg
                     # messagePayload is base64-encoded JSON candidate object
+                    cand_str = ""
+                    sdp_mid = "0"
+                    sdp_mline = 0
                     if isinstance(payload, str) and len(payload) > 10:
                         try:
                             decoded = json.loads(base64.b64decode(payload).decode())
@@ -425,13 +609,11 @@ async def connect_and_stream(
                             sdp_mid = decoded.get("sdpMid", "0")
                             sdp_mline = decoded.get("sdpMLineIndex", 0)
                         except Exception:
-                            cand_str = ""
+                            pass
                     elif isinstance(payload, dict):
                         cand_str = payload.get("candidate", "")
                         sdp_mid = payload.get("sdpMid", "0")
                         sdp_mline = payload.get("sdpMLineIndex", 0)
-                    else:
-                        cand_str = ""
 
                     if cand_str and "candidate:" in cand_str:
                         try:
@@ -442,6 +624,11 @@ async def connect_and_stream(
                             logger.debug(f"ICE candidate added: {cand_str[:80]}")
                         except Exception as e:
                             logger.warning(f"ICE parse failed: {e} — {cand_str[:80]}")
+
+                # Camera disconnected — break immediately so main() retries fast
+                if msg_type == "PEER_OUT":
+                    logger.warning("PEER_OUT received — camera disconnected, retrying")
+                    break
 
                 # Track connection state
                 if pc.connectionState == "connected" and not connected.is_set():
@@ -457,6 +644,8 @@ async def connect_and_stream(
     except Exception as e:
         logger.error(f"Signaling error: {e}", exc_info=True)
     finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
         _kill_ffmpeg(ffmpeg_state)
         await pc.close()
 
@@ -486,7 +675,7 @@ async def _stream_video(track, rtsp_output: str, state: dict):
 
             try:
                 data = frame.to_ndarray(format="yuv420p")
-                proc.stdin.write(data.tobytes())
+                proc.stdin.write(data.tobytes())  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("ffmpeg pipe broken — reconnecting")
                 break

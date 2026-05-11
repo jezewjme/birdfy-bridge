@@ -30,18 +30,18 @@ import os
 import sys
 from pathlib import Path
 
-from birdfy_api import get_addx_ticket, get_devices, login
+from birdfy_api import get_addx_ticket, get_devices, login, select_single_device, stop_live
 from webrtc_client import connect_and_stream
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 log_file = os.getenv("LOG_FILE", "birdfy-bridge.log")
 
-log_handlers = [logging.StreamHandler(sys.stdout)]
+log_handlers = [logging.StreamHandler(stream=open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False))]
 if log_file:
     log_path = Path(log_file)
     if log_path.parent:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+    log_handlers.append(logging.FileHandler(log_path, mode="a", encoding="utf-8"))
 
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
@@ -90,21 +90,31 @@ async def run_once():
     on_addx = target.get("onAddx", False)
 
     if on_addx:
-        # Step 3a: Addx WebRTC path
+        # Step 3a: Addx WebRTC path. Browser HAR shows the per-session order is:
+        #   selectsingledevice  → getWebrtcTicket → WS attempt
+        #   on failure: stoplive → getWebrtcTicket → WS retry (new traceId)
+        # We mirror it: do the select once on session start, then let
+        # connect_and_stream's internal retry handle stoplive+new-ticket.
         device_region = target.get("region") or auth_data.get("region")
-        logger.info(f"Device uses Addx WebRTC — fetching ticket (region={device_region}) ...")
-        ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
-
         a4x_user_id = str(auth_data.get("userID", ""))
         serial = target["serialNumber"]
 
+        logger.info(f"Device uses Addx WebRTC — fetching ticket (region={device_region}) ...")
+        ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
+        await select_single_device(ticket)
+
         logger.info(f"Connecting to Addx WebRTC -> RTSP output: {RTSP_OUTPUT}")
-        await connect_and_stream(
-            ticket=ticket,
-            rtsp_output=RTSP_OUTPUT,
-            a4x_user_id=a4x_user_id,
-            serial_number=serial,
-        )
+        try:
+            await connect_and_stream(
+                ticket=ticket,
+                rtsp_output=RTSP_OUTPUT,
+                a4x_user_id=a4x_user_id,
+                serial_number=serial,
+            )
+        finally:
+            # Mirror the browser teardown so the cloud doesn't keep a stale
+            # session pinned to our (now-dead) traceId. Best-effort.
+            await stop_live(ticket)
     else:
         # Step 3b: KVS WebRTC path (not yet implemented)
         # The camera does not use Addx. It uses AWS Kinesis Video Streams.
@@ -125,15 +135,27 @@ async def run_once():
 async def main():
     retry_delay = 10
     while True:
+        import time
+        t_start = time.monotonic()
         try:
             await run_once()
             logger.warning("Session ended cleanly — reconnecting")
         except Exception as e:
             logger.error(f"Bridge error: {e}", exc_info=(log_level == "DEBUG"))
 
-        logger.info(f"Waiting {retry_delay}s before retry ...")
-        await asyncio.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 120)  # exponential backoff, max 2 min
+        elapsed = time.monotonic() - t_start
+        if elapsed < 60:
+            # Short session = camera rejected us (second PEER_IN / PEER_OUT) or
+            # signaling error. Failed handshakes can last up to ~50s (camera waits
+            # before sending PEER_OUT), so threshold is 60s not 30s. With the
+            # second-PEER_IN fix, failures now end in ~5s so 60s is generous.
+            logger.info("Short session — retrying in 2s ...")
+            await asyncio.sleep(2)
+            retry_delay = 10  # reset backoff
+        else:
+            logger.info(f"Waiting {retry_delay}s before retry ...")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 120)
 
 
 if __name__ == "__main__":
