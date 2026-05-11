@@ -55,8 +55,10 @@ logger = logging.getLogger(__name__)
 #
 # Keeping aiortc's default behavior here on purpose; do not re-add the patch.
 
-# How long to wait between frames before declaring the track dead
-FRAME_TIMEOUT = 30
+# How long to wait between decoded frames before declaring the track dead.
+# Birdfy camera takes 30s+ to produce a first decodable frame even with PLIs;
+# during steady-state, gaps are <1s.
+FRAME_TIMEOUT = 90
 DATA_CHANNEL_LABEL = os.getenv("BIRDFY_DC_LABEL", "webDataChannel")
 DATA_CHANNEL_PROTOCOL = os.getenv("BIRDFY_DC_PROTOCOL", "")
 _default_payloads = [
@@ -625,7 +627,7 @@ async def _pli_nudger(pc):
                 logger.debug("PLI nudger: no active video SSRC yet")
             await asyncio.sleep(2.0)
     except asyncio.CancelledError:
-        logger.debug("PLI nudger cancelled (first frame decoded)")
+        logger.debug("PLI nudger cancelled")
         raise
 
 
