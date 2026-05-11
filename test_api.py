@@ -18,8 +18,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("test")
 
-EMAIL    = os.getenv("BIRDFY_EMAIL",    "jjezewski@gmail.com")
-PASSWORD = os.getenv("BIRDFY_PASSWORD", "iPoG8hJiAdpwbTbE")
+EMAIL    = os.environ.get("BIRDFY_EMAIL")
+PASSWORD = os.environ.get("BIRDFY_PASSWORD")
+if not EMAIL or not PASSWORD:
+    sys.exit(
+        "Set BIRDFY_EMAIL and BIRDFY_PASSWORD in the environment "
+        "(e.g. via .env) before running this script."
+    )
 
 
 async def main():

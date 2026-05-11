@@ -91,6 +91,44 @@ def _md5(s: str) -> str:
     return hashlib.md5(s.encode()).hexdigest()
 
 
+# Fields that should never appear in plaintext in logs, even at DEBUG level.
+# Cloud responses for auth + ticketing contain tokens, signed URLs, AWS
+# credentials, and ICE TURN creds — leaking any of these gives an attacker
+# the same access as the bridge.
+_SENSITIVE_FIELDS = frozenset({
+    "token", "accessToken", "refreshToken", "sessionToken",
+    "sign", "signature", "secret", "secretKey", "accessKey",
+    "password", "credential", "credentials",
+})
+
+
+def _redact_response(text: str, *, limit: int = 600) -> str:
+    """Best-effort scrub of secret-bearing fields from a JSON response body.
+
+    Used when logging HTTP responses at DEBUG. Falls back to logging only the
+    keys + status if the body isn't JSON.
+    """
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        return f"<non-JSON, {len(text)}B>"
+
+    def _scrub(obj):
+        if isinstance(obj, dict):
+            return {
+                k: ("***REDACTED***" if k in _SENSITIVE_FIELDS else _scrub(v))
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [_scrub(v) for v in obj]
+        return obj
+
+    scrubbed = json.dumps(_scrub(body), separators=(",", ":"))
+    if len(scrubbed) > limit:
+        return scrubbed[:limit] + "...<truncated>"
+    return scrubbed
+
+
 def _hmac_sha256_hex(key: str, data: str) -> str:
     return hmac.new(key.encode(), data.encode(), hashlib.sha256).hexdigest()
 
@@ -152,11 +190,11 @@ async def login(email: str, password: str) -> dict:
                 headers=headers,
             ) as resp:
                 text = await resp.text()
-                logger.debug(f"  HTTP {resp.status}: {text[:800]}")
+                logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
 
                 if resp.status not in (200, 201):
                     raise RuntimeError(
-                        f"Auth HTTP {resp.status}: {text[:400]}\n"
+                        f"Auth HTTP {resp.status}: {_redact_response(text, limit=400)}\n"
                         "Check NVS_UCID and NVS_UDID env vars, and that credentials are correct."
                     )
 
@@ -164,7 +202,10 @@ async def login(email: str, password: str) -> dict:
                 # Response is wrapped: {code:0, data:{token, userID, ...}}
                 data = body.get("data") or body
                 if not data.get("token"):
-                    logger.error(f"Full auth response: {body}")
+                    logger.error(
+                        f"Auth response missing 'token'. Keys present: "
+                        f"{list(body.keys()) if isinstance(body, dict) else type(body).__name__}"
+                    )
                     raise RuntimeError(
                         "Auth succeeded but no 'token' field found. "
                         "Check full auth response in DEBUG logs."
@@ -213,9 +254,9 @@ async def get_devices(auth_data: dict) -> list:
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             text = await resp.text()
-            logger.debug(f"  HTTP {resp.status}: {text[:600]}")
+            logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
             if resp.status != 200:
-                raise RuntimeError(f"Devices HTTP {resp.status}: {text[:300]}")
+                raise RuntimeError(f"Devices HTTP {resp.status}: {_redact_response(text, limit=300)}")
             body = json.loads(text)
             devices = body.get("data", {}).get("devices") or body.get("devices") or []
             logger.info(f"Got {len(devices)} devices")
@@ -293,12 +334,14 @@ async def get_addx_ticket(
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 text = await resp.text()
-                logger.debug(f"  HTTP {resp.status}: {text[:800]}")
+                logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
                 if resp.status == 200:
                     break
                 logger.warning(f"  HTTP {resp.status} with this auth style, trying next...")
         else:
-            raise RuntimeError(f"Addx token failed with all auth styles. Last response: {text[:300]}")
+            raise RuntimeError(
+                f"Addx token failed with all auth styles. Last response: {_redact_response(text, limit=300)}"
+            )
 
         body = json.loads(text)
         addx_data = body.get("data") or body
@@ -307,7 +350,7 @@ async def get_addx_ticket(
         language = addx_data.get("language", "en")
         country_no = addx_data.get("countryNo", "US")
         if not addx_token or not addx_endpoint:
-            logger.error(f"Addx token response: {text[:600]}")
+            logger.error(f"Addx token response: {_redact_response(text)}")
             raise RuntimeError(
                 "Addx token response missing 'token' or 'endpoint' fields. "
                 "Check DEBUG logs for full response."
@@ -338,14 +381,16 @@ async def get_addx_ticket(
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             text = await resp.text()
-            logger.debug(f"  HTTP {resp.status}: {text[:800]}")
+            logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
             if resp.status != 200:
-                raise RuntimeError(f"WebRTC ticket HTTP {resp.status}: {text[:300]}")
+                raise RuntimeError(f"WebRTC ticket HTTP {resp.status}: {_redact_response(text, limit=300)}")
             body = json.loads(text)
             ticket = body.get("data") or body
             result = ticket.get("result", ticket.get("code", 0))
             if result != 0:
-                raise RuntimeError(f"WebRTC ticket error result={result}: {text[:300]}")
+                raise RuntimeError(
+                    f"WebRTC ticket error result={result}: {_redact_response(text, limit=300)}"
+                )
             logger.info(
                 f"Ticket OK -- signalServer={ticket.get('signalServer')} "
                 f"groupId={ticket.get('groupId')} role={ticket.get('role')} "
@@ -410,9 +455,11 @@ async def select_single_device(ticket: dict) -> bool:
                 url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 text = await resp.text()
-                logger.debug(f"  HTTP {resp.status}: {text[:400]}")
+                logger.debug(f"  HTTP {resp.status}: {_redact_response(text, limit=400)}")
                 if resp.status != 200:
-                    logger.warning(f"selectsingledevice HTTP {resp.status}: {text[:200]}")
+                    logger.warning(
+                        f"selectsingledevice HTTP {resp.status}: {_redact_response(text, limit=200)}"
+                    )
                     return False
                 logger.info("selectsingledevice OK")
                 return True
@@ -454,9 +501,11 @@ async def stop_live(ticket: dict) -> bool:
                 url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
             ) as resp:
                 text = await resp.text()
-                logger.debug(f"  HTTP {resp.status}: {text[:400]}")
+                logger.debug(f"  HTTP {resp.status}: {_redact_response(text, limit=400)}")
                 if resp.status != 200:
-                    logger.warning(f"stoplive HTTP {resp.status}: {text[:200]}")
+                    logger.warning(
+                        f"stoplive HTTP {resp.status}: {_redact_response(text, limit=200)}"
+                    )
                     return False
                 return True
     except Exception as e:
@@ -498,9 +547,11 @@ async def get_stream_play(auth_data: dict, device: dict, provider: str = "KVS_WE
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
             text = await resp.text()
-            logger.debug(f"  HTTP {resp.status}: {text[:800]}")
+            logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
             if resp.status != 200:
-                raise RuntimeError(f"Stream play HTTP {resp.status}: {text[:300]}")
+                raise RuntimeError(
+                    f"Stream play HTTP {resp.status}: {_redact_response(text, limit=300)}"
+                )
             body = json.loads(text)
             data = body.get("data") or body
             logger.info(f"Stream play OK — keys: {list(data.keys()) if isinstance(data, dict) else data}")

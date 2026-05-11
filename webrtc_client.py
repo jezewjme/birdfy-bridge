@@ -34,112 +34,14 @@ import uuid
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCBundlePolicy
-
 from aiortc.sdp import candidate_from_sdp
-import aioice.ice
-import aioice.stun as stun
-from aioice.candidate import candidate_priority
+
+# Side-effect import: installs aioice monkey-patches required for the Addx
+# camera's STUN/ICE quirks. See _aioice_patches.py for what each patch does.
+import _aioice_patches  # noqa: F401
+from _sdp_patches import apply_offer_patches, extract_trickle_candidates
 
 logger = logging.getLogger(__name__)
-
-# --- MONKEY PATCH AIOICE + AIORTC FOR ADDX CAMERAS ---
-# Bug 1 — wrong ufrag in outgoing BINDING_REQs (intermittent):
-#   Camera sometimes sends USERNAME='ours:stale_ufrag' where stale_ufrag != its SDP ufrag.
-#   Original aioice rejects with 400; camera never completes ICE on its side.
-#
-# Bug 2 — aioice nominates once then stops (ice.py:850, ice.py:880-940):
-#   After our first USE-CANDIDATE check succeeds, aioice never sends another. If the
-#   camera missed/rejected that single check, it sits in "checking" forever, hammering
-#   us with BINDING_REQs at ~50ms intervals. THE HAMMER below sends a fresh
-#   BINDING_REQ + USE-CANDIDATE on every camera ping, sidestepping aioice's state
-#   machine entirely.
-#
-# Bug 3 — camera says setup:active but never sends DTLS ClientHello:
-#   Camera's ICE stays "checking" → never initiates DTLS. We force aiortc to be the
-#   DTLS client so WE send the ClientHello. If the camera firmware is libwebrtc-derived
-#   (as Tuya/Vicohome/Hisilicon stacks typically are), it has a DTLS server ready
-#   regardless of the SDP role declaration.
-_orig_request_received = aioice.ice.Connection.request_received
-_ufrag_done: set = set()  # connections where we've already updated remote_username
-
-def _patched_request_received(self, message, addr, protocol, raw_data):
-    if message.message_method != stun.Method.BINDING:
-        return _orig_request_received(self, message, addr, protocol, raw_data)
-
-    # 1. Update remote ufrag on first mismatch (camera's stale-session bug)
-    username = message.attributes.get("USERNAME", "")
-    conn_id = id(self)
-    if username and ":" in username and conn_id not in _ufrag_done:
-        their_ufrag = username.split(":", 1)[1]
-        if self.remote_username and self.remote_username != their_ufrag:
-            logger.warning(
-                f"aioice: ufrag mismatch — SDP={self.remote_username!r} "
-                f"camera={their_ufrag!r}; updating remote_username"
-            )
-            self.remote_username = their_ufrag
-            _ufrag_done.add(conn_id)
-
-    # 2. Diagnostic: log pair state for this addr
-    pair_state = "no-pair"
-    for p in self._check_list:
-        if p.remote_addr == addr:
-            pair_state = (
-                f"{p.state.name} nom={p.nominated} "
-                f"task={'set' if p.task else 'none'}"
-            )
-            break
-    logger.debug(
-        f"camera REQ from {addr} user={username!r} "
-        f"use_cand={'USE-CANDIDATE' in message.attributes} pair={pair_state}"
-    )
-
-    # 3. Always respond SUCCESS (signed with our local_password — adds MESSAGE-INTEGRITY + FINGERPRINT)
-    response = stun.Message(
-        message_method=stun.Method.BINDING,
-        message_class=stun.Class.RESPONSE,
-        transaction_id=message.transaction_id,
-    )
-    response.attributes["XOR-MAPPED-ADDRESS"] = addr
-    if self.local_password:
-        response.add_message_integrity(self.local_password.encode("utf8"))
-    protocol.send_stun(response, addr)
-
-    # 4. THE HAMMER: fire a fresh USE-CANDIDATE on every camera ping.
-    # Bypasses aioice's "nominate once then stop" behavior so the camera always has
-    # a fresh, valid USE-CANDIDATE check arriving with the correct ufrag and HMAC.
-    if self.ice_controlling and self.remote_username and self.remote_password:
-        try:
-            component = protocol.local_candidate.component
-            req = stun.Message(
-                message_method=stun.Method.BINDING,
-                message_class=stun.Class.REQUEST,
-            )
-            req.attributes["USERNAME"] = f"{self.remote_username}:{self.local_username}"
-            req.attributes["PRIORITY"] = candidate_priority(component, "prflx")
-            req.attributes["ICE-CONTROLLING"] = self._tie_breaker
-            req.attributes["USE-CANDIDATE"] = None  # flag attr
-            req.add_message_integrity(self.remote_password.encode("utf8"))
-            protocol.send_stun(req, addr)
-        except Exception as e:
-            logger.debug(f"hammer failed (non-fatal): {e}")
-
-    # 5. Best-effort triggered-check (no-op once pair is SUCCEEDED)
-    try:
-        if self._check_list:
-            self.check_incoming(message, addr, protocol)
-    except Exception:
-        pass
-
-aioice.ice.Connection.request_received = _patched_request_received
-
-# NOTE: DTLS force-client patch was removed 2026-05-04.
-# It was needed only because BUNDLE was broken (BALANCED policy created two transports
-# and DTLS was being attached to the one whose ICE never completed, so the camera never
-# sent ClientHello). With bundlePolicy=MAX_BUNDLE there's a single transport and ICE
-# completes cleanly, so the camera honors its SDP setup:active role and sends ClientHello
-# as expected. Forcing our side to client made aiortc reject the camera's ClientHello
-# with a Fatal/Unexpected Message alert.
-# --------------------------------------------
 
 # SCTP role: aiortc default (is_server=False, SCTP client, sends INIT first).
 #
@@ -189,7 +91,11 @@ def _build_ws_url(ticket: dict) -> str:
     if access_token:
         url += f"&accessToken={access_token}"
     url += "&name=a4x"
-    logger.info(f"WebSocket URL: {url[:140]}...")
+    # URL carries the HMAC signature in `sign=` and an access token; log only
+    # the server + path so DEBUG output is safe to share for bug reports.
+    logger.info(
+        f"WebSocket URL: {signal_server}/{group_id}/{role}/{client_id} (auth params redacted)"
+    )
     return url
 
 
@@ -264,40 +170,6 @@ def _ice_candidate_msg(
         "messagePayload": _b64_encode(payload),
         "mode": "vicoo",
     }
-
-
-def _extract_candidates_from_sdp(sdp: str) -> list[dict]:
-    """Parse a=candidate: lines out of an SDP and group them by m-line.
-
-    Returns one dict per candidate: {candidate, sdpMid, sdpMLineIndex, ufrag}.
-    With MAX_BUNDLE the same candidates appear under each m=, but the browser
-    only trickles candidates with sdpMLineIndex=0 (mid="0"), so we mirror that.
-    """
-    out: list[dict] = []
-    sdp_mline = -1
-    sdp_mid = "0"
-    ufrag = ""
-    for raw_line in sdp.splitlines():
-        line = raw_line.strip()
-        if line.startswith("m="):
-            sdp_mline += 1
-            # mid will follow in the same m-section; reset
-            sdp_mid = str(sdp_mline)
-        elif line.startswith("a=mid:"):
-            sdp_mid = line[len("a=mid:"):].strip()
-        elif line.startswith("a=ice-ufrag:"):
-            ufrag = line[len("a=ice-ufrag:"):].strip()
-        elif line.startswith("a=candidate:") and sdp_mline == 0:
-            cand_no_prefix = line[len("a="):]  # "candidate:..."
-            out.append({
-                "candidate": cand_no_prefix,
-                "sdpMid": sdp_mid,
-                "sdpMLineIndex": 0,
-                "ufrag": ufrag,
-            })
-    return out
-
-
 
 
 async def connect_and_stream(
@@ -421,36 +293,25 @@ async def connect_and_stream(
     logger.info("Creating SDP offer ...")
     _pre_offer = await pc.createOffer()
     await pc.setLocalDescription(_pre_offer)
-    _pre_sdp = pc.localDescription.sdp
-    # Camera's SDP parser requires an explicit a=sctpmap line alongside a=sctp-port;
-    # without it SDP_ANSWER never returns.
-    if "a=sctp-port:5000" in _pre_sdp and "a=sctpmap:5000" not in _pre_sdp:
-        _pre_sdp = _pre_sdp.replace(
-            "a=sctp-port:5000\r\n",
-            "a=sctp-port:5000\r\na=sctpmap:5000 webrtc-datachannel 1024\r\n",
-        )
+    _pre_sdp, _patch_info = apply_offer_patches(pc.localDescription.sdp)
+    if _patch_info["sctpmap_injected"]:
         logger.info("SDP patched: injected a=sctpmap:5000 for camera compat")
+    if _patch_info["fingerprints_stripped"]:
+        logger.info(
+            f"SDP patched: stripped {_patch_info['fingerprints_stripped']} "
+            "sha-384/sha-512 fingerprint lines (browser only sends sha-256)"
+        )
 
     # Match Chrome/Edge usrsctp defaults (1024 streams) instead of aiortc's 65535.
+    # Camera's SCTP stack apparently allocates per-stream state up front and OOMs
+    # (or hits a hard cap) when offered 65535. Private aiortc attribute — pin
+    # aiortc to a known-good minor range in requirements.txt.
     if pc.sctp is not None:
         pc.sctp._outbound_streams_count = 1024
         pc.sctp._inbound_streams_max = 1024
         logger.info("SCTP: capped OS/MIS to 1024 to match Chrome/Edge")
 
-    # Strip non-sha-256 DTLS fingerprints. Camera's SDP parser picks a non-sha-256
-    # line whose hash won't match the cert observed during the handshake; DTLS still
-    # completes (it doesn't verify) but every record afterwards is silently dropped,
-    # including the SCTP INIT. Browsers ship only sha-256, so do the same.
-    _sdp_lines = _pre_sdp.split("\r\n")
-    _filtered = [ln for ln in _sdp_lines if not ln.startswith("a=fingerprint:sha-384")
-                 and not ln.startswith("a=fingerprint:sha-512")]
-    if len(_filtered) != len(_sdp_lines):
-        _pre_sdp = "\r\n".join(_filtered)
-        logger.info(
-            f"SDP patched: stripped {len(_sdp_lines) - len(_filtered)} sha-384/sha-512 "
-            "fingerprint lines (browser only sends sha-256)"
-        )
-    _gathered_candidates = _extract_candidates_from_sdp(_pre_sdp)
+    _gathered_candidates = extract_trickle_candidates(_pre_sdp)
     _host_candidate = next(
         (c for c in _gathered_candidates if " typ host" in c["candidate"]),
         _gathered_candidates[0] if _gathered_candidates else None,
