@@ -431,6 +431,34 @@ async def connect_and_stream(
             "a=sctp-port:5000\r\na=sctpmap:5000 webrtc-datachannel 1024\r\n",
         )
         logger.info("SDP patched: injected a=sctpmap:5000 for camera compat")
+
+    # Cap SCTP OS/MIS to 1024 to match Chrome/Edge's usrsctp defaults.
+    # aiortc hardcodes both to MAX_STREAMS=65535. Wireshark comparison of our INIT
+    # vs Edge's INIT (Birdify with Edge connecting successfully.pcapng, frame ~4786)
+    # shows identical chunk layout and size — the only sanity-checkable difference
+    # is OS/MIS. The Hisilicon/Tuya SCTP stack on this camera silently drops INITs
+    # with 64x more streams than its allocator can serve, which matches what we see:
+    # INIT goes out, camera ignores it, we retransmit forever.
+    if pc.sctp is not None:
+        pc.sctp._outbound_streams_count = 1024
+        pc.sctp._inbound_streams_max = 1024
+        logger.info("SCTP: capped OS/MIS to 1024 to match Chrome/Edge")
+
+    # Strip sha-384 / sha-512 DTLS fingerprints. Chrome/Edge send only sha-256.
+    # aiortc emits all three per m-section. A stricter remote SDP parser that picks
+    # the LAST fingerprint line (sha-512) would compute a different DTLS cert hash
+    # than what the camera actually saw during the handshake — handshake still
+    # succeeds (we never check), but every post-handshake payload (incl. SCTP INIT)
+    # could be silently dropped. Matches what we observe: DTLS OK, INIT ignored.
+    _sdp_lines = _pre_sdp.split("\r\n")
+    _filtered = [ln for ln in _sdp_lines if not ln.startswith("a=fingerprint:sha-384")
+                 and not ln.startswith("a=fingerprint:sha-512")]
+    if len(_filtered) != len(_sdp_lines):
+        _pre_sdp = "\r\n".join(_filtered)
+        logger.info(
+            f"SDP patched: stripped {len(_sdp_lines) - len(_filtered)} sha-384/sha-512 "
+            "fingerprint lines (browser only sends sha-256)"
+        )
     _gathered_candidates = _extract_candidates_from_sdp(_pre_sdp)
     _host_candidate = next(
         (c for c in _gathered_candidates if " typ host" in c["candidate"]),
