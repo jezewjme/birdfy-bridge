@@ -37,9 +37,8 @@ AUDIO_ENABLED = os.getenv("BIRDFY_AUDIO", "1") not in ("0", "false", "False", ""
 AUDIO_SAMPLE_FMT = os.getenv("BIRDFY_AUDIO_FORMAT", "mulaw")  # ffmpeg -f value
 AUDIO_SAMPLE_RATE = int(os.getenv("BIRDFY_AUDIO_RATE", "8000"))
 AUDIO_CHANNELS = int(os.getenv("BIRDFY_AUDIO_CHANNELS", "1"))
-# fd number ffmpeg reads the audio pipe from (pipe:3). Must not collide with
-# 0/1/2 (stdin/stdout/stderr).
-_AUDIO_FD = 3
+# ffmpeg reads the audio pipe from whatever fd os.pipe() handed us (passed via
+# pass_fds and referenced as pipe:<fd>) — see _AudioPump. No fixed fd number.
 
 logger = logging.getLogger(__name__)
 
@@ -233,13 +232,26 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         # ffmpeg assigns evenly-spaced, monotonic timestamps regardless of how
         # jittery our frame delivery is.
         "-r", str(FRAME_RATE),
+    ]
+    if audio_read_fd is not None:
+        # Decouple input demux threads so a momentarily-starved audio pipe can't
+        # stall the video demux (and vice versa) once running.
+        cmd += ["-thread_queue_size", "512"]
+    cmd += [
         "-f", "h264",
         "-i", "pipe:0",
     ]
     if audio_read_fd is not None:
         cmd += [
-            # Raw G.711 µ-law has no header; declare format/rate/channels so
-            # ffmpeg derives a clean sample-clock PTS starting at 0.
+            # Raw G.711 µ-law has no header and we declare format/rate/channels
+            # explicitly, so there is nothing to probe. The default probe waits
+            # for ~0.5-5s of audio bytes before opening the input — but ffmpeg
+            # won't connect the RTSP output until BOTH inputs are open, so a slow
+            # audio start hung the whole publish ("no stream available"). Force
+            # zero analyze/probe so audio opens instantly on the first byte.
+            "-analyzeduration", "0",
+            "-probesize", "32",
+            "-thread_queue_size", "512",
             "-f", AUDIO_SAMPLE_FMT,
             "-ar", str(AUDIO_SAMPLE_RATE),
             "-ac", str(AUDIO_CHANNELS),
@@ -301,6 +313,18 @@ class _AudioPump:
     async def _pump(self) -> None:
         loop = asyncio.get_event_loop()
         try:
+            # Prime the pipe with a few ms of µ-law silence (0xFF == silence in
+            # µ-law) so ffmpeg's audio input opens on the very first read instead
+            # of blocking until the camera sends real audio. ffmpeg won't connect
+            # the RTSP output until BOTH inputs are open, so an unprimed audio
+            # pipe could hang the whole publish if the camera gates audio. ~50ms
+            # @ 8 kHz mono = 400 bytes — inaudible, just unblocks startup.
+            try:
+                await loop.run_in_executor(
+                    None, _write_all, self._write_fd, b"\xff" * (AUDIO_SAMPLE_RATE // 20)
+                )
+            except (BrokenPipeError, OSError):
+                return
             while True:
                 data = await self._queue.get()
                 if data is None:  # sentinel — shutdown
