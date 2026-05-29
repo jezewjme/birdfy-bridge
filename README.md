@@ -6,6 +6,10 @@ An interoperability tool that converts a Birdfy / Netvue camera's WebRTC stream 
 >
 > This project is for use with cameras **you own**. Using it may violate Netvue's Terms of Service and could result in your Birdfy account being suspended or terminated — use a **dedicated account**, not your primary one. The project ships with no warranty (see [LICENSE](LICENSE)).
 
+## Status
+
+**Working** — the Birdfy Feeder Bamboo streams reliably into Frigate over RTSP via the bundled MediaMTX. The WebRTC handshake, keyframe recovery, and timestamp handling are all confirmed against live captures. Known rough edges are listed under [What's not done](#whats-not-done).
+
 ## Supported cameras
 
 - **Birdfy Feeder Bamboo** (confirmed)
@@ -60,10 +64,28 @@ You can bypass the bundled MediaMTX entirely and publish straight to Frigate's g
 | `LOG_FILE`       | No       | Path for file log (default: `birdfy-bridge.log`; empty = stdout only) |
 | `NVS_UCID`       | No       | App client ID (default: `513774810c`) |
 | `NVS_UDID`       | No       | Stable device UUID for signing (auto-generated and persisted per-host if unset) |
+| `BIRDFY_STATE_DIR`         | No | Directory for the persisted UDID + cached auth token (default: home dir; `compose.yaml` sets `/data`, backed by a volume). See [Token persistence](#token-persistence). |
+| `NVS_NO_TOKEN_CACHE`       | No | Set to disable token caching and always do a fresh login. |
+| `BIRDFY_FRAME_RATE`        | No | Constant output frame rate fed to ffmpeg (default: `15`, the camera's negotiated rate). See [RTP receive-path quirks](#rtp-receive-path-quirks). |
+| `BIRDFY_JITTER_CAPACITY`   | No | aiortc video jitter buffer size, power of 2 (default: `2048`). Widened to fit large keyframes. |
+| `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
+| `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |
+| `BIRDFY_NACK_MAX_RETRIES`  | No | Max re-NACK re-sends per missing packet (default: `12`). |
+
+## Token persistence
+
+On every start the bridge tries to **reuse a cached login token** instead of calling `/users/login/v2` again. A fresh login is what makes Netvue send a *"new device logged in"* email, so reusing the token keeps those from arriving on each restart.
+
+How it works: after a successful login the token (plus region/endpoint) is written to `BIRDFY_STATE_DIR/.birdfy_auth_cache.json` (mode `0600`), alongside the persisted device UDID. On the next start the bridge validates the cached token with a device-list call and only falls back to a fresh login if the token is missing, belongs to a different account, or is rejected. A transient network error during validation does **not** trigger a re-login — the retry loop waits and tries the cache again.
+
+For this to survive container recreation, `BIRDFY_STATE_DIR` must point at a persistent path. The bundled `compose.yaml` sets `BIRDFY_STATE_DIR=/data` backed by a named `birdfy-state` volume, so it works out of the box. If you run the image without that compose file, add an equivalent volume (e.g. `-v birdfy-state:/data -e BIRDFY_STATE_DIR=/data`), or the token (and UDID) will be lost on every recreate and the emails return.
+
+Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 
 ## Security warnings
 
 - **`.env` contains your full Birdfy account password.** Anyone with that file can log into your account and reach every camera, doorbell, or other Netvue device on it. Keep it out of backups, repos, and shared drives. Use a dedicated Birdfy account for the bridge if at all possible.
+- **`BIRDFY_STATE_DIR/.birdfy_auth_cache.json` contains a usable login token.** It's written `0600` and git-ignored, but treat the state volume as sensitive — a leaked token grants account access until it expires. Delete the file (or the volume) to force a fresh login.
 - **The bundled MediaMTX has no authentication.** This is fine on a trusted LAN. **Do not expose port 8554 to the public internet** — anyone who can reach it can pull your stream. If you must, configure `publishUser` / `readUser` in `docker/mediamtx.yml` and put the container behind a reverse proxy.
 - **DEBUG logs may still contain non-secret identifying data** (device serials, region info, ICE server URLs). Bearer tokens, signed URLs, refresh tokens, and AWS credentials are redacted, but treat DEBUG logs as semi-sensitive when sharing them in bug reports.
 - **Netvue's API is reverse-engineered, not contracted.** It can change at any time. The bridge fails loudly when it does; please open an issue if your account suddenly stops authenticating or device-list returns 4xx.
@@ -71,9 +93,10 @@ You can bypass the bundled MediaMTX entirely and publish straight to Frigate's g
 ## What's not done
 
 - **KVS WebRTC path**: `onAddx: false` devices (some newer outdoor cameras) use AWS Kinesis Video Streams. Currently raises `NotImplementedError`. Contributions welcome.
-- **Initial keyframe latency**: After the data channel opens, the camera takes ~15s to send a decodable keyframe. Sending an RTCP PLI immediately after `startLive` would shorten this.
+- **Initial keyframe latency**: After the data channel opens, the camera takes a few seconds to send the first keyframe. The bridge sends RTCP PLI/FIR to nudge it, but the first decodable frame still lags connection by a few seconds.
 - **Token refresh**: The login token has an expiry. The bridge currently re-authenticates on disconnect; the `/auth/refreshtoken` endpoint isn't used.
 - **Audio**: Audio track is received but not muxed into the RTSP output (video-only).
+- **Publish-level healthcheck**: The container healthcheck only verifies MediaMTX is listening, not that the stream is actively publishing — by design (see [RTP receive-path quirks](#rtp-receive-path-quirks)).
 
 ## How it works
 
@@ -105,7 +128,13 @@ The Birdfy / Netvue cloud API uses a custom auth scheme reverse-engineered from 
    - ICE candidates use same format with `messagePayload: base64(json(candidate))`
    - Heartbeat: re-send last cached ICE candidate every `ticket.signalPingInterval` seconds
 
-6. **Video** received as H264 via aiortc, decoded to raw YUV420p frames, piped to ffmpeg for re-encoding and RTSP push.
+6. **Video** received as H264 via aiortc. We do **not** decode/re-encode: aiortc's
+   libavcodec H264 decoder can't decode this camera's bitstream, and Frigate
+   re-encodes anyway. Instead we tap aiortc's jitter buffer between depayload and
+   decode, pull the reassembled Annex B frames, and pipe them to an
+   `ffmpeg -c copy -f rtsp` passthrough (see [`_rtp_forwarder.py`](_rtp_forwarder.py)).
+   No decode, no re-encode. See [RTP receive-path quirks](#rtp-receive-path-quirks)
+   for the keyframe-recovery and timestamp fixes that make this reliable.
 
 ### KVS WebRTC path (`onAddx: false` — not yet implemented)
 
@@ -141,6 +170,30 @@ x-nvs-version:   {"signature":2}
 
 The camera's WebRTC stack rejects several things aiortc emits by default. See [`_sdp_patches.py`](_sdp_patches.py) and [`_aioice_patches.py`](_aioice_patches.py) for the rewrites and runtime patches — each one is necessary and load-bearing; do not "clean them up" without consulting the pcap evidence referenced in the comments.
 
+## RTP receive-path quirks
+
+Two more load-bearing fixes live in [`_aiortc_media_patches.py`](_aiortc_media_patches.py) and [`_rtp_forwarder.py`](_rtp_forwarder.py); both were confirmed against captured logs.
+
+### Keyframe corruption (garbage frames with no start code)
+
+The camera's keyframes are large (~25–52 KB ≈ 50–110 RTP packets of FU-A fragments). aiortc's video jitter buffer defaults to `capacity=128`, so one keyframe nearly fills it; any reorder or a not-yet-recovered lost packet evicts the **head** of the keyframe (the FU-A start fragment carrying the NAL header + Annex B start code), and the surviving fragments reassemble into headerless garbage that nothing can decode. aiortc also NACKs a missing packet only **once** and only tracks gaps within `RTP_HISTORY_SIZE=128`.
+
+`_aiortc_media_patches.py` fixes this by (1) widening the video jitter buffer (128 → 2048), (2) widening the NACK tracking window (128 → 1024), and (3) adding a **periodic re-NACK** loop per video receiver that re-requests still-missing sequence numbers until they arrive — which is what actually recovers a dropped keyframe-head fragment. All four parameters are env-tunable (see [Configuration](#configuration)). It also logs the camera's advertised RTCP feedback (whether `nack` is supported), every re-NACK, and a per-session corruption tally for debugging.
+
+### Stream drops (broken timestamps → Frigate fps-cap kill → 404 cascade)
+
+The passthrough ffmpeg originally stamped frames at arrival wall-clock time. But NACK-recovered and reordered frames arrive out of order, so wall-clock DTS went backwards (`Non-monotonous DTS` in ffmpeg logs) and the stream looked like ~30 fps to Frigate. Frigate's fps-cap watchdog then killed its reader, which tore down the RTSP session, broke our ffmpeg's pipe, and dropped the MediaMTX path — after which Frigate's restart hit `404 Not Found` in a restart cascade.
+
+Fixed in `_rtp_forwarder.py` by declaring the input as constant `BIRDFY_FRAME_RATE` fps (default 15, the camera's negotiated rate) and forcing CFR output, so ffmpeg emits clean monotonic timestamps regardless of how jittery our frame delivery is.
+
+### Container healthcheck
+
+The Docker `HEALTHCHECK` is a deliberately **cheap TCP liveness probe** — a raw TCP connect to MediaMTX's RTSP port 8554 (via the Python interpreter already in the image). It confirms MediaMTX is up so the bridge has somewhere to publish.
+
+> Note: an earlier version did `curl http://localhost:8554/`, but 8554 is RTSP, not HTTP — MediaMTX rejected it (`invalid HTTP request`), the probe always failed, and the container was pinned in `starting`/`unhealthy` even while streaming fine.
+
+It intentionally does **not** verify that the `birdfy` path is actively publishing. The stream legitimately tears down and republishes during normal Frigate/WebRTC reconnects (and the feeder camera sleeps), so a publish-level healthcheck would flap to `unhealthy` and could restart a working container. If you want publish-level visibility, expose it as separate monitoring (e.g. enable MediaMTX's HTTP API in [`docker/mediamtx.yml`](docker/mediamtx.yml) and poll `/v3/paths/get/birdfy`), not as the container health signal.
+
 ## Development
 
 ```bash
@@ -155,13 +208,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
 ## Dependencies
 
 ### Python (`requirements.txt`)
-- `aiortc` — WebRTC library (handles SDP, ICE, H264 decode)
+- `aiortc` — WebRTC library (handles SDP, ICE, H264 depayload). Patched at runtime; see [RTP receive-path quirks](#rtp-receive-path-quirks).
 - `aiohttp` — async HTTP for API calls
 - `websockets` — WebSocket client for signaling
-- `av`, `numpy` — video frame handling
+- `av`, `numpy` — pulled in by aiortc (we don't decode video ourselves)
 
 ### System (Docker image installs these)
-- `ffmpeg` — re-encode H264 + push RTSP
+- `ffmpeg` — H264 passthrough (`-c copy`) + push RTSP (no re-encode)
 - `mediamtx` — bundled RTSP server (latest release fetched at build time)
 - `s6-overlay` — process supervisor for running mediamtx + bridge together
 

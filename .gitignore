@@ -17,6 +17,10 @@ venv/
 .env.*
 !.env.example
 
+# Persisted per-host auth/device state (contains a usable token + device UDID)
+.birdfy_auth_cache.json
+.birdfy_nvs_udid
+
 # Logs
 *.log
 

@@ -64,12 +64,17 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8554/tcp 8554/udp
 
-# Healthcheck: MediaMTX exposes RTSP DESCRIBE on the same port. We use curl to
-# probe TCP reachability of the RTSP port — if MediaMTX is dead the bridge has
-# nowhere to publish to. Doesn't verify that the bridge itself is publishing
-# (that requires watching ffmpeg logs); keep it cheap.
+# Healthcheck: probe TCP reachability of the RTSP port — if MediaMTX is dead the
+# bridge has nowhere to publish to. We must NOT speak HTTP here: 8554 is RTSP, so
+# `curl http://localhost:8554/` makes MediaMTX log "invalid HTTP request" and
+# returns non-2xx, which made `curl -fsS` always fail and pinned the container in
+# "starting"/"unhealthy" even while the bridge was working. Instead do a raw TCP
+# connect using the Python interpreter that's guaranteed present in this image
+# (no dependence on bash /dev/tcp, nc, or curl). Succeeds iff something is
+# listening on 8554. Doesn't verify the bridge is actively publishing (that needs
+# the MediaMTX HTTP API); keep it cheap.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS -m 3 -o /dev/null http://localhost:8554/ \
+    CMD python -c "import socket; socket.create_connection(('localhost',8554),3).close()" \
         || exit 1
 
 ENTRYPOINT ["/init"]

@@ -65,9 +65,20 @@ logger = logging.getLogger(__name__)
 # App constants (observed in web app bundle)
 NVS_UCID = os.getenv("NVS_UCID", "513774810c")
 
+# Directory for persisted per-host state (UDID + cached auth token). Defaults to
+# the home dir for backwards compat, but is overridable via BIRDFY_STATE_DIR so
+# Docker can point it at a mounted volume — otherwise both files are lost on every
+# container recreate, which defeats UDID stability AND token reuse and brings back
+# the "new device logged in" emails. See compose.yaml / README.
+_STATE_DIR = pathlib.Path(os.getenv("BIRDFY_STATE_DIR", str(pathlib.Path.home())))
+try:
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _STATE_DIR = pathlib.Path.home()
+
 # Persist UDID so the Netvue backend sees the same "device" on every restart
 # and doesn't spam "new device connected" notifications.
-_UDID_FILE = pathlib.Path.home() / ".birdfy_nvs_udid"
+_UDID_FILE = _STATE_DIR / ".birdfy_nvs_udid"
 if os.getenv("NVS_UDID"):
     NVS_UDID = os.getenv("NVS_UDID")
 elif _UDID_FILE.exists():
@@ -83,8 +94,69 @@ else:
 # Global auth state — populated by login()
 _auth_state: dict = {}
 
+# Persist the successful auth response (token + region + localEndpoint) so a
+# container restart can REUSE the existing token instead of doing a fresh
+# /users/login/v2 every time. A fresh login is what triggers Netvue's "new device
+# logged in" notification email — reusing the token avoids it. The file lives in
+# the same per-host home dir as the UDID; mount that dir as a Docker volume to
+# persist across image reboots (see README). Contains a bearer-equivalent token,
+# so it's written with 0600 perms.
+_AUTH_CACHE_FILE = _STATE_DIR / ".birdfy_auth_cache.json"
+
 # Base login URL (no region prefix needed for login)
 AUTH_BASE = "https://localweb.nvts.co/v1"
+
+
+class AuthExpiredError(RuntimeError):
+    """Raised when a cached token is rejected by an authenticated API call."""
+
+
+def _load_cached_auth() -> dict | None:
+    """Return the cached auth dict if present and parseable, else None."""
+    if os.getenv("NVS_NO_TOKEN_CACHE"):
+        return None
+    try:
+        if not _AUTH_CACHE_FILE.exists():
+            return None
+        data = json.loads(_AUTH_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning(f"Could not read auth cache {_AUTH_CACHE_FILE}: {e}")
+        return None
+    # Must be tied to the same account; a stale cache for a different email is
+    # useless (and would fail validation anyway).
+    if not isinstance(data, dict) or not data.get("token"):
+        return None
+    return data
+
+
+def _save_cached_auth(data: dict, email: str) -> None:
+    """Persist the auth response for reuse on the next start. Best-effort.
+
+    Stores the account email alongside so a credential change invalidates the
+    cache. Written 0600 since it holds a usable token.
+    """
+    if os.getenv("NVS_NO_TOKEN_CACHE"):
+        return
+    try:
+        to_store = dict(data)
+        to_store["_cached_email"] = email
+        to_store["_cached_at"] = int(time.time())
+        # Write then chmod (write_text won't set mode on existing files).
+        _AUTH_CACHE_FILE.write_text(json.dumps(to_store), encoding="utf-8")
+        try:
+            os.chmod(_AUTH_CACHE_FILE, 0o600)
+        except OSError:
+            pass
+        logger.info(f"Saved auth token cache to {_AUTH_CACHE_FILE}")
+    except OSError as e:
+        logger.warning(f"Could not write auth cache {_AUTH_CACHE_FILE}: {e}")
+
+
+def _clear_cached_auth() -> None:
+    try:
+        _AUTH_CACHE_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _md5(s: str) -> str:
@@ -217,12 +289,59 @@ async def login(email: str, password: str) -> dict:
                     f"region={data.get('region')} "
                     f"localEndpoint={data.get('localEndpoint')}"
                 )
+                _save_cached_auth(data, email)
                 return data
 
         except RuntimeError:
             raise
         except Exception as e:
             raise RuntimeError(f"Auth request failed: {e}") from e
+
+
+async def login_or_resume(email: str, password: str) -> tuple[dict, list]:
+    """Authenticate, reusing a cached token if one is still valid.
+
+    A fresh /users/login/v2 is what makes Netvue send a "new device logged in"
+    email, so on restart we try the cached token first and only re-login if it's
+    missing, for a different account, or rejected.
+
+    Validation doubles as the device-list fetch (the very next thing the caller
+    needs), so the happy path costs no extra round-trip. Returns (auth_data,
+    devices).
+    """
+    cached = _load_cached_auth()
+    if cached and cached.get("_cached_email") in (None, email):
+        logger.info(
+            "Found cached auth token (saved %s) — validating before reuse ...",
+            cached.get("_cached_at"),
+        )
+        try:
+            devices = await get_devices(cached)
+            global _auth_state
+            _auth_state = cached
+            logger.info(
+                "Reusing cached token — no fresh login needed "
+                "(userID=%s region=%s)",
+                cached.get("userID"),
+                cached.get("region"),
+            )
+            return cached, devices
+        except AuthExpiredError as e:
+            logger.info("Cached token rejected (%s) — doing a fresh login.", e)
+            _clear_cached_auth()
+        except Exception as e:
+            # Network/other error: don't burn a fresh login (and a "new device"
+            # email) on a transient failure — surface it so the caller's retry
+            # loop waits and tries the cache again.
+            raise RuntimeError(f"Token validation failed (transient?): {e}") from e
+    elif cached:
+        logger.info("Cached token is for a different account — ignoring.")
+        _clear_cached_auth()
+
+    # No usable cache: fresh login (triggers the new-device email once).
+    auth_data = await login(email, password)
+    devices = await get_devices(auth_data)
+    return auth_data, devices
 
 
 async def get_devices(auth_data: dict) -> list:
@@ -255,9 +374,26 @@ async def get_devices(auth_data: dict) -> list:
         ) as resp:
             text = await resp.text()
             logger.debug(f"  HTTP {resp.status}: {_redact_response(text)}")
+            if resp.status in (401, 403):
+                # Token rejected — the caller (resume path) should re-login.
+                raise AuthExpiredError(
+                    f"Devices HTTP {resp.status} (token rejected): "
+                    f"{_redact_response(text, limit=200)}"
+                )
             if resp.status != 200:
                 raise RuntimeError(f"Devices HTTP {resp.status}: {_redact_response(text, limit=300)}")
             body = json.loads(text)
+            # Some deployments wrap auth failures in a 200 with a non-zero code
+            # (e.g. {"code": 401/1002, "msg": "token expired"}). Treat those as
+            # auth-expired too so the resume path falls back to a fresh login.
+            code = body.get("code", body.get("result", 0))
+            if code in (401, 403, 1002, 1003) and not (
+                body.get("data", {}).get("devices") or body.get("devices")
+            ):
+                raise AuthExpiredError(
+                    f"Devices returned auth-failure code={code}: "
+                    f"{_redact_response(text, limit=200)}"
+                )
             devices = body.get("data", {}).get("devices") or body.get("devices") or []
             logger.info(f"Got {len(devices)} devices")
             return devices

@@ -3,6 +3,8 @@ Birdfy RTSP bridge — main entry point.
 
 Auth flow (reverse-engineered from my.birdfy.com web app, confirmed working):
   1. POST https://localweb.nvts.co/v1/users/login/v2 → token, userID, region, localEndpoint
+     (skipped when a cached token from a previous run still validates — see
+     birdfy_api.login_or_resume; avoids Netvue's "new device logged in" email)
   2. GET  {localEndpoint}/v1/devices/v3              → device list (find your camera by serial)
   3a. If device.onAddx == True (Birdfy Feeder Bamboo, Feeder, Cam, etc.):
       GET {localEndpoint}/v1/addx/token/v2 → ticket{signalServer, groupId, role, id, iceServer, ...}
@@ -32,7 +34,7 @@ import os
 import sys
 from pathlib import Path
 
-from birdfy_api import get_addx_ticket, get_devices, login, select_single_device, stop_live
+from birdfy_api import get_addx_ticket, login_or_resume, select_single_device, stop_live
 from webrtc_client import connect_and_stream
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -62,15 +64,14 @@ RTSP_OUTPUT     = os.getenv("RTSP_OUTPUT") or (
 
 
 async def run_once():
-    # Step 1: Authenticate
+    # Step 1+2: Authenticate (reusing a cached token if still valid) and fetch
+    # the device list. login_or_resume avoids a fresh /users/login/v2 — and the
+    # "new device logged in" email it triggers — when a cached token still works,
+    # and returns the device list from the same validation call.
     logger.info(f"Authenticating as {BIRDFY_EMAIL} ...")
-    auth_data = await login(BIRDFY_EMAIL, BIRDFY_PASSWORD)
+    auth_data, devices = await login_or_resume(BIRDFY_EMAIL, BIRDFY_PASSWORD)
     user_id = str(auth_data.get("userID", ""))
     logger.info(f"Authenticated — userID={user_id} region={auth_data.get('region')}")
-
-    # Step 2: Find the target device
-    logger.info("Fetching device list ...")
-    devices = await get_devices(auth_data)
 
     target = None
     if DEVICE_ID:

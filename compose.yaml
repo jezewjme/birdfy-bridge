@@ -16,3 +16,12 @@ services:
     # Disabling logging to file inside the container — let docker handle it.
     environment:
       LOG_FILE: ""
+      # Persist the UDID + cached auth token here so restarts reuse the same
+      # "device" and token instead of doing a fresh login (which triggers
+      # Netvue's "new device logged in" email). Backed by the named volume below.
+      BIRDFY_STATE_DIR: /data
+    volumes:
+      - birdfy-state:/data
+
+volumes:
+  birdfy-state:
