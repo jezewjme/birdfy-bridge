@@ -36,12 +36,14 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 from aiortc.rtcconfiguration import RTCBundlePolicy
 from aiortc.sdp import candidate_from_sdp
 
-# Side-effect import: installs aioice monkey-patches required for the Addx
-# camera's STUN/ICE quirks. See _aioice_patches.py for what each patch does.
+# Side-effect imports (must run before constructing the RTCPeerConnection):
+#   _aioice_patches        — aioice monkey-patches for the Addx camera's STUN/ICE
+#                            quirks. See _aioice_patches.py.
+#   _aiortc_media_patches  — aiortc RTP receive-path patches (wider video jitter
+#                            buffer + NACK history + periodic re-NACK) so large
+#                            keyframes aren't evicted before their head fragment
+#                            is recovered. See _aiortc_media_patches.py.
 import _aioice_patches  # noqa: F401
-# Side-effect import: installs aiortc RTP receive-path patches (wider video
-# jitter buffer + NACK history + periodic re-NACK) so large keyframes aren't
-# evicted before their head fragment is recovered. See _aiortc_media_patches.py.
 import _aiortc_media_patches
 from _rtp_forwarder import forward_video
 from _sdp_patches import apply_offer_patches, extract_trickle_candidates
@@ -656,6 +658,7 @@ async def _pli_nudger(pc):
     "request keyframe" API, so we reach into receiver internals.
     """
     from struct import pack
+
     from aiortc.rtp import RTCP_PSFB_FIR, RtcpPsfbPacket
 
     fir_seq = 0

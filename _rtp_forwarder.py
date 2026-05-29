@@ -20,9 +20,9 @@ How we hook in:
 """
 import asyncio
 import logging
+import os
 import subprocess
 import tempfile
-from typing import Optional
 
 from aiortc.jitterbuffer import JitterBuffer, JitterFrame
 
@@ -39,6 +39,11 @@ BIG_FRAME_BYTES = 15000
 # Cap how many corrupt keyframes we dump to disk per session (avoid filling /tmp).
 MAX_GARBAGE_DUMPS = 5
 
+# The camera's negotiated frame rate (confirmed in ffmpeg's input probe: "15 fps").
+# We feed ffmpeg as constant-rate at this value so output timestamps are clean and
+# Frigate's fps-cap watchdog doesn't tear the stream down. Override via env.
+FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "15"))
+
 # Where ffmpeg's stderr is written. We tail this into the main log on exit so
 # ffmpeg's own diagnosis ("non-existing PPS", "Invalid data", etc.) is visible
 # in the bridge log rather than only in a temp file.
@@ -48,7 +53,7 @@ _FFMPEG_LOG_PATH = tempfile.gettempdir() + "/ffmpeg_birdfy_passthrough.log"
 def _log_ffmpeg_tail(max_lines: int = 40) -> None:
     """Emit the tail of ffmpeg's stderr log to the bridge logger (best-effort)."""
     try:
-        with open(_FFMPEG_LOG_PATH, "r", errors="replace") as f:
+        with open(_FFMPEG_LOG_PATH, errors="replace") as f:
             lines = f.readlines()
     except OSError:
         return
@@ -125,8 +130,8 @@ class _ParamSetCache:
     """
 
     def __init__(self) -> None:
-        self.sps: Optional[bytes] = None
-        self.pps: Optional[bytes] = None
+        self.sps: bytes | None = None
+        self.pps: bytes | None = None
 
     @property
     def ready(self) -> bool:
@@ -146,7 +151,7 @@ def _wrap_jitter_buffer(receiver, on_frame) -> None:
     `on_frame` runs on the same loop/thread as _handle_rtp_packet (no locking).
     Idempotent: re-wrapping is a no-op via a marker attribute.
     """
-    jb: Optional[JitterBuffer] = getattr(receiver, "_RTCRtpReceiver__jitter_buffer", None)
+    jb: JitterBuffer | None = getattr(receiver, "_RTCRtpReceiver__jitter_buffer", None)
     if jb is None:
         raise RuntimeError("receiver has no __jitter_buffer — aiortc internals changed")
 
@@ -186,17 +191,32 @@ def _unwrap_jitter_buffer(receiver) -> None:
 def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
     """Start ffmpeg in H264-passthrough mode writing to RTSP.
 
-    -fflags +genpts + -use_wallclock_as_timestamps 1: the raw Annex B stream we
-      feed in has no container timing, so let ffmpeg stamp at arrival wall time.
+    Timestamps: the raw Annex B stream we feed in has no container timing. We
+    previously used -use_wallclock_as_timestamps, but stamping at *arrival* wall
+    time is wrong here — NACK-recovered and reordered frames arrive out of order,
+    so wall-clock DTS goes backwards. ffmpeg then logs "Non-monotonous DTS" and
+    emits a ~30fps-looking jittery stream, which trips Frigate's fps-cap watchdog
+    and tears the whole RTSP path down (404 cascade). Instead we declare the
+    input as constant FRAME_RATE fps H264 (-r before -i) and let ffmpeg generate
+    clean monotonic PTS/DTS at that rate (-fflags +genpts, -fps_mode cfr). The
+    camera's negotiated stream is 15 fps (confirmed in ffmpeg input probe).
+
     -c copy: no re-encode (the whole point of this path).
     """
     cmd = [
         "ffmpeg", "-y",
         "-fflags", "+genpts",
-        "-use_wallclock_as_timestamps", "1",
+        # Treat the headerless H264 we pipe in as constant FRAME_RATE fps so
+        # ffmpeg assigns evenly-spaced, monotonic timestamps regardless of how
+        # jittery our frame delivery is.
+        "-r", str(FRAME_RATE),
         "-f", "h264",
         "-i", "pipe:0",
         "-c:v", "copy",
+        # Constant frame rate output: pad/drop to keep DTS strictly monotonic so
+        # downstream (Frigate) sees a stable rate and doesn't fps-cap-kill us.
+        "-fps_mode", "cfr",
+        "-r", str(FRAME_RATE),
         "-an",
         "-f", "rtsp",
         "-rtsp_transport", "tcp",
@@ -231,7 +251,7 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
 
     _wrap_jitter_buffer(receiver, _on_frame)
 
-    proc: Optional[subprocess.Popen] = None
+    proc: subprocess.Popen | None = None
     params = _ParamSetCache()
     pre_proc_frames_dropped = 0
     frames_in = 0

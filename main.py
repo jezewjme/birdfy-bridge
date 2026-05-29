@@ -65,12 +65,11 @@ async def run_once():
     # Step 1: Authenticate
     logger.info(f"Authenticating as {BIRDFY_EMAIL} ...")
     auth_data = await login(BIRDFY_EMAIL, BIRDFY_PASSWORD)
-    token = auth_data["token"]
     user_id = str(auth_data.get("userID", ""))
     logger.info(f"Authenticated — userID={user_id} region={auth_data.get('region')}")
 
     # Step 2: Find the target device
-    logger.info(f"Fetching device list ...")
+    logger.info("Fetching device list ...")
     devices = await get_devices(auth_data)
 
     target = None
