@@ -50,6 +50,44 @@ From another host: `rtsp://<host-running-birdfy-bridge>:8554/birdfy`.
 
 You can bypass the bundled MediaMTX entirely and publish straight to Frigate's go2rtc by setting `RTSP_OUTPUT=rtsp://frigate:8554/birdfy` in `.env`.
 
+#### Recommended setup: use a downscaled detect substream
+
+The bridge outputs a single **1920×1080** H264 stream. If you point Frigate's `detect` role straight at it, Frigate's ffmpeg has to **software-decode full 1080p** for every analyzed frame — which shows up as high ffmpeg CPU (e.g. a "high FFmpeg CPU usage" warning). The camera only offers one WebRTC stream, so there's no native substream to fall back on.
+
+The fix is to let **go2rtc** create a downscaled detect stream from the single bridge feed, and split Frigate's roles so `detect` reads the small stream while `record`/`live` keep full resolution:
+
+```yaml
+go2rtc:
+  streams:
+    # Full-res stream — one connection to the bridge.
+    birdfy:
+      - rtsp://birdfy-bridge:8554/birdfy
+    # Downscaled detect substream. Sourcing from the go2rtc "birdfy" stream
+    # (not the bridge URL) reuses that single bridge connection; go2rtc just
+    # fans it out. Use #hardware if your host has a GPU (e.g. Intel VAAPI);
+    # drop it to scale on CPU (still cheap at 640x360).
+    birdfy_sub:
+      - "ffmpeg:birdfy#video=h264#hardware#width=640#height=360"
+
+cameras:
+  BirdfyFeeder:
+    ffmpeg:
+      hwaccel_args: preset-vaapi   # if you have a supported GPU
+      inputs:
+        - path: rtsp://127.0.0.1:8554/birdfy_sub
+          input_args: preset-rtsp-restream
+          roles: [detect]
+        - path: rtsp://127.0.0.1:8554/birdfy
+          input_args: preset-rtsp-restream
+          roles: [record]
+    detect:
+      width: 640
+      height: 360
+      fps: 5
+```
+
+This keeps a **single** connection to the bridge (go2rtc derives the substream internally) and drops detect-side CPU dramatically, since the detector decodes a ~9× smaller frame. Reload the Frigate config after editing — it doesn't auto-reload.
+
 ## Configuration
 
 | Env var          | Required | Description |
