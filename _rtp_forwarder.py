@@ -31,6 +31,36 @@ logger = logging.getLogger(__name__)
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
 _START_CODE = b"\x00\x00\x00\x01"
 
+# Frames at/above this size are keyframe-sized for this camera (~25-52 KB IDRs
+# vs ~1-6 KB P-frames). We log every one in full detail since they're rare and
+# are exactly where the corruption shows up.
+BIG_FRAME_BYTES = 15000
+
+# Cap how many corrupt keyframes we dump to disk per session (avoid filling /tmp).
+MAX_GARBAGE_DUMPS = 5
+
+# Where ffmpeg's stderr is written. We tail this into the main log on exit so
+# ffmpeg's own diagnosis ("non-existing PPS", "Invalid data", etc.) is visible
+# in the bridge log rather than only in a temp file.
+_FFMPEG_LOG_PATH = tempfile.gettempdir() + "/ffmpeg_birdfy_passthrough.log"
+
+
+def _log_ffmpeg_tail(max_lines: int = 40) -> None:
+    """Emit the tail of ffmpeg's stderr log to the bridge logger (best-effort)."""
+    try:
+        with open(_FFMPEG_LOG_PATH, "r", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+    tail = lines[-max_lines:]
+    if tail:
+        logger.info(
+            "RTP forwarder: ffmpeg stderr tail (%d of %d lines):\n%s",
+            len(tail),
+            len(lines),
+            "".join(tail).rstrip(),
+        )
+
 # NAL unit types we care about. RFC 6184 §1.3.
 NAL_SLICE = 1       # non-IDR coded slice
 NAL_IDR = 5         # IDR coded slice (keyframe)
@@ -38,6 +68,15 @@ NAL_SEI = 6
 NAL_SPS = 7
 NAL_PPS = 8
 NAL_AUD = 9
+
+# Frames at/above this size are keyframe-scale for this camera (P-frames are
+# <7 KB; observed keyframes are 25-52 KB). Used to single out keyframe-sized
+# frames for detailed diagnostic logging.
+BIG_FRAME_BYTES = 12000
+
+# How many distinct corrupt keyframe-sized frames to dump to disk for offline
+# inspection before giving up (avoids filling /tmp on a stuck stream).
+MAX_GARBAGE_DUMPS = 3
 
 
 def _iter_nals(data: bytes):
@@ -168,7 +207,7 @@ def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=open(tempfile.gettempdir() + "/ffmpeg_birdfy_passthrough.log", "w"),
+        stderr=open(_FFMPEG_LOG_PATH, "w"),
     )
 
 
@@ -197,6 +236,11 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
     pre_proc_frames_dropped = 0
     frames_in = 0
     bytes_in = 0
+    # Diagnostics for keyframe-recovery debugging (see _aiortc_media_patches.py).
+    total_frames_seen = 0
+    garbage_frames_seen = 0   # frames with no Annex B start code (lost head)
+    idr_frames_seen = 0
+    garbage_dumps = 0
     try:
         while True:
             try:
@@ -212,17 +256,66 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                 params.observe(nal_type, nal)
 
             has_idr = NAL_IDR in nal_types
+            has_start_code = data[:4] == _START_CODE
+            # A "garbage" frame is one with no Annex B start code anywhere — the
+            # signature of a keyframe whose head fragment was lost/evicted (see
+            # _aiortc_media_patches.py). Track these explicitly so we can tell
+            # whether the NACK/jitter fix actually recovered the keyframe head.
+            is_garbage = not nal_types
+
+            total_frames_seen += 1
+            if is_garbage:
+                garbage_frames_seen += 1
+            if has_idr:
+                idr_frames_seen += 1
 
             # Debug: log the first few frames' shape so we can see what aiortc
             # actually hands us (start-code layout, NAL types observed).
             if pre_proc_frames_dropped < 5 and proc is None:
                 head = data[:16].hex(" ")
                 logger.info(
-                    "RTP forwarder: frame %d bytes head=%s nal_types=%s",
+                    "RTP forwarder: frame %d bytes head=%s start_code=%s nal_types=%s",
                     len(data),
                     head,
+                    has_start_code,
                     nal_types,
                 )
+
+            # Big frames are keyframe-sized. Log every big frame's shape + whether
+            # it parsed, plus a running tally, so a failed run still shows whether
+            # keyframes are arriving clean now. (Cheap: big frames are infrequent.)
+            if len(data) >= BIG_FRAME_BYTES:
+                head = data[:16].hex(" ")
+                logger.info(
+                    "RTP forwarder: BIG frame %d bytes head=%s start_code=%s "
+                    "nal_types=%s garbage=%s (tally: frames=%d garbage=%d idr=%d)",
+                    len(data),
+                    head,
+                    has_start_code,
+                    nal_types,
+                    is_garbage,
+                    total_frames_seen,
+                    garbage_frames_seen,
+                    idr_frames_seen,
+                )
+                # Dump the first few corrupt big frames to disk for offline
+                # inspection (hex/structure) if the fix didn't take.
+                if is_garbage and garbage_dumps < MAX_GARBAGE_DUMPS:
+                    garbage_dumps += 1
+                    try:
+                        dump_path = (
+                            f"{tempfile.gettempdir()}/birdfy_garbage_frame_{garbage_dumps}.bin"
+                        )
+                        with open(dump_path, "wb") as f:
+                            f.write(data)
+                        logger.info(
+                            "RTP forwarder: dumped corrupt frame #%d (%d bytes) to %s",
+                            garbage_dumps,
+                            len(data),
+                            dump_path,
+                        )
+                    except Exception as e:
+                        logger.debug("garbage frame dump failed: %s", e)
 
             if proc is None:
                 # Wait for a keyframe AND a known SPS+PPS before starting ffmpeg,
@@ -232,11 +325,15 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                     pre_proc_frames_dropped += 1
                     if pre_proc_frames_dropped in (1, 10, 50) or pre_proc_frames_dropped % 100 == 0:
                         logger.info(
-                            "RTP forwarder: waiting for SPS+PPS+IDR (dropped %d frames, sps=%s pps=%s idr=%s)",
+                            "RTP forwarder: waiting for SPS+PPS+IDR (dropped %d frames, "
+                            "sps=%s pps=%s idr=%s | seen=%d garbage=%d idr_total=%d)",
                             pre_proc_frames_dropped,
                             params.sps is not None,
                             params.pps is not None,
                             has_idr,
+                            total_frames_seen,
+                            garbage_frames_seen,
+                            idr_frames_seen,
                         )
                     continue
                 proc = _start_ffmpeg(rtsp_output)
@@ -248,6 +345,7 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
 
             if proc.poll() is not None:
                 logger.warning("RTP forwarder: ffmpeg exited with code %s", proc.returncode)
+                _log_ffmpeg_tail()
                 return
 
             # Prepend cached SPS+PPS to every IDR so a downstream decoder that
@@ -261,6 +359,7 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                 proc.stdin.write(out)  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("RTP forwarder: ffmpeg pipe broken")
+                _log_ffmpeg_tail()
                 return
 
             frames_in += 1
@@ -272,6 +371,16 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                     bytes_in,
                 )
     finally:
+        logger.info(
+            "RTP forwarder summary: frames_seen=%d garbage(no-start-code)=%d "
+            "idr_total=%d frames_forwarded=%d bytes_forwarded=%d ffmpeg_started=%s",
+            total_frames_seen,
+            garbage_frames_seen,
+            idr_frames_seen,
+            frames_in,
+            bytes_in,
+            proc is not None,
+        )
         _unwrap_jitter_buffer(receiver)
         if proc is not None and proc.poll() is None:
             try:

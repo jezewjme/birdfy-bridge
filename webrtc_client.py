@@ -39,6 +39,10 @@ from aiortc.sdp import candidate_from_sdp
 # Side-effect import: installs aioice monkey-patches required for the Addx
 # camera's STUN/ICE quirks. See _aioice_patches.py for what each patch does.
 import _aioice_patches  # noqa: F401
+# Side-effect import: installs aiortc RTP receive-path patches (wider video
+# jitter buffer + NACK history + periodic re-NACK) so large keyframes aren't
+# evicted before their head fragment is recovered. See _aiortc_media_patches.py.
+import _aiortc_media_patches
 from _rtp_forwarder import forward_video
 from _sdp_patches import apply_offer_patches, extract_trickle_candidates
 
@@ -272,6 +276,12 @@ async def connect_and_stream(
                 asyncio.ensure_future(
                     forward_video(receiver, rtsp_output, frame_timeout=FRAME_TIMEOUT)
                 )
+                # Periodic re-NACK: aiortc requests a missing packet only once.
+                # Large keyframes (~50-110 packets) can lose their head fragment
+                # and never recover before the jitter buffer evicts it; this loop
+                # re-requests still-missing seqs until they arrive. See
+                # _aiortc_media_patches.py for the full rationale.
+                _aiortc_media_patches.attach_periodic_renack(receiver)
                 # Still nudge the camera for an early keyframe.
                 asyncio.ensure_future(_pli_nudger(pc))
         else:
@@ -503,8 +513,17 @@ async def connect_and_stream(
                         # debugging decode failures.
                         for line in sdp.splitlines():
                             ls = line.strip()
-                            if ls.startswith("a=rtpmap:") or ls.startswith("a=fmtp:"):
+                            if (
+                                ls.startswith("a=rtpmap:")
+                                or ls.startswith("a=fmtp:")
+                                or ls.startswith("a=rtcp-fb:")
+                                or ls.startswith("a=ssrc-group:")
+                            ):
                                 logger.info(f"SDP_ANSWER negotiated: {ls}")
+                        # Log the parsed per-codec RTCP feedback (esp. NACK
+                        # support) so keyframe-recovery debugging has the camera's
+                        # advertised capabilities in the log even if video fails.
+                        _aiortc_media_patches.log_video_rtcp_feedback(pc)
 
                 # ICE candidate from camera
                 elif msg_type in ("ICE_CANDIDATE", "candidate", "iceCandidate"):
@@ -557,6 +576,11 @@ async def connect_and_stream(
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
+        # Stop any periodic re-NACK loops attached to this pc's video receivers
+        # so they don't leak across reconnects.
+        for transceiver in pc.getTransceivers():
+            if transceiver.kind == "video" and transceiver.receiver is not None:
+                _aiortc_media_patches.detach_periodic_renack(transceiver.receiver)
         _kill_ffmpeg(ffmpeg_state)
         await pc.close()
 
