@@ -231,6 +231,24 @@ def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
     )
 
 
+def _reap_ffmpeg(proc: subprocess.Popen | None) -> None:
+    """Best-effort cleanup of a dead/dying ffmpeg so we don't leak the process or
+    its stdin pipe when restarting. Safe to call on an already-exited process."""
+    if proc is None:
+        return
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    except Exception:
+        pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0) -> None:
     """Pump depayloaded H264 frames from `receiver` to ffmpeg → RTSP.
 
@@ -261,6 +279,11 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
     garbage_frames_seen = 0   # frames with no Annex B start code (lost head)
     idr_frames_seen = 0
     garbage_dumps = 0
+    # Resilience counters: a single bad frame or transient ffmpeg death must not
+    # kill the stream permanently (it used to — ffmpeg died on a headerless frame
+    # and was never restarted, leaving MediaMTX with "no stream is available").
+    garbage_frames_skipped = 0
+    ffmpeg_restarts = 0
     try:
         while True:
             try:
@@ -341,6 +364,16 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                     except Exception as e:
                         logger.debug("garbage frame dump failed: %s", e)
 
+            # A headerless frame (no Annex B start code / no parseable NALs) is the
+            # signature of a keyframe whose head fragment was lost despite the NACK
+            # widening. It is unusable to the -c copy muxer: feeding it makes ffmpeg
+            # log "Invalid data found" and exit, which previously killed the stream
+            # permanently. Skipping it costs exactly one frame; the next keyframe
+            # re-syncs the decoder. Never write garbage to ffmpeg.
+            if is_garbage:
+                garbage_frames_skipped += 1
+                continue
+
             if proc is None:
                 # Wait for a keyframe AND a known SPS+PPS before starting ffmpeg,
                 # otherwise the h264 demuxer errors with "non-existing PPS 0
@@ -368,9 +401,18 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                 )
 
             if proc.poll() is not None:
-                logger.warning("RTP forwarder: ffmpeg exited with code %s", proc.returncode)
+                logger.warning(
+                    "RTP forwarder: ffmpeg exited with code %s — will restart on next keyframe",
+                    proc.returncode,
+                )
                 _log_ffmpeg_tail()
-                return
+                _reap_ffmpeg(proc)
+                proc = None
+                ffmpeg_restarts += 1
+                # Re-arm the keyframe gate so the fresh ffmpeg starts on a clean
+                # SPS+PPS+IDR boundary rather than mid-GOP.
+                pre_proc_frames_dropped = 0
+                continue
 
             # Prepend cached SPS+PPS to every IDR so a downstream decoder that
             # tunes in mid-stream (or restarts after errors) can re-sync.
@@ -382,9 +424,13 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
             try:
                 proc.stdin.write(out)  # type: ignore[union-attr]
             except BrokenPipeError:
-                logger.warning("RTP forwarder: ffmpeg pipe broken")
+                logger.warning("RTP forwarder: ffmpeg pipe broken — will restart on next keyframe")
                 _log_ffmpeg_tail()
-                return
+                _reap_ffmpeg(proc)
+                proc = None
+                ffmpeg_restarts += 1
+                pre_proc_frames_dropped = 0
+                continue
 
             frames_in += 1
             bytes_in += len(out)
@@ -397,12 +443,15 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
     finally:
         logger.info(
             "RTP forwarder summary: frames_seen=%d garbage(no-start-code)=%d "
-            "idr_total=%d frames_forwarded=%d bytes_forwarded=%d ffmpeg_started=%s",
+            "garbage_skipped=%d idr_total=%d frames_forwarded=%d bytes_forwarded=%d "
+            "ffmpeg_restarts=%d ffmpeg_started=%s",
             total_frames_seen,
             garbage_frames_seen,
+            garbage_frames_skipped,
             idr_frames_seen,
             frames_in,
             bytes_in,
+            ffmpeg_restarts,
             proc is not None,
         )
         _unwrap_jitter_buffer(receiver)
