@@ -212,14 +212,24 @@ def attach_periodic_renack(receiver) -> None:
                 try:
                     await receiver._send_rtcp_nack(media_ssrc, to_request)
                     total_renacks += 1
-                    if total_renacks <= 20 or total_renacks % 50 == 0:
+                    # Occasional re-NACK is normal packet-loss recovery, not an
+                    # event worth an INFO line each time — keep per-send detail at
+                    # DEBUG and emit a periodic INFO heartbeat so steady-state logs
+                    # stay quiet while deep debugging still gets the full picture.
+                    logger.debug(
+                        "Re-NACK #%d: ssrc=%d requesting %d missing seqs %s%s",
+                        total_renacks,
+                        media_ssrc,
+                        len(to_request),
+                        to_request[:16],
+                        " ..." if len(to_request) > 16 else "",
+                    )
+                    if total_renacks % 200 == 0:
                         logger.info(
-                            "Re-NACK #%d: ssrc=%d requesting %d missing seqs %s%s",
+                            "Re-NACK heartbeat: %d re-NACKs sent so far "
+                            "(latest: %d missing seqs)",
                             total_renacks,
-                            media_ssrc,
                             len(to_request),
-                            to_request[:16],
-                            " ..." if len(to_request) > 16 else "",
                         )
                 except Exception as e:
                     logger.debug("Re-NACK send failed (non-fatal): %s", e)

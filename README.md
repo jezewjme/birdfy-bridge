@@ -61,6 +61,7 @@ You can bypass the bundled MediaMTX entirely and publish straight to Frigate's g
 | `RTSP_HOST`      | No       | RTSP server host:port (default: `localhost:8554` — the bundled MediaMTX) |
 | `RTSP_PATH`      | No       | RTSP stream path (default: `birdfy`) |
 | `LOG_LEVEL`      | No       | `DEBUG` / `INFO` / `WARNING` (default: `INFO`) |
+| `NOISY_LOG_LEVEL`| No       | Floor for chatty aiortc/aioice/websockets loggers (default: `WARNING`). These log every RTP packet at DEBUG; set to `DEBUG` to get full packet traces when debugging. |
 | `LOG_FILE`       | No       | Path for file log (default: `birdfy-bridge.log`; empty = stdout only) |
 | `NVS_UCID`       | No       | App client ID (default: `513774810c`) |
 | `NVS_UDID`       | No       | Stable device UUID for signing (auto-generated and persisted per-host if unset) |

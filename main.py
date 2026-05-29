@@ -53,6 +53,31 @@ logging.basicConfig(
     handlers=log_handlers,
     force=True,
 )
+
+# Tame third-party per-packet/per-frame log spam. aiortc.rtcrtpreceiver logs
+# EVERY RTP packet at DEBUG (~50k lines/min, ~99% of the log volume); the other
+# aiortc/aioice/websockets DEBUG streams are similarly chatty. Even when we run
+# our own code at DEBUG we almost never want that firehose, so pin these noisy
+# libraries to a higher floor. Override the floor with NOISY_LOG_LEVEL=DEBUG to
+# get the full packet trace back for deep debugging.
+_noisy_log_level = os.getenv("NOISY_LOG_LEVEL", "WARNING").upper()
+for _noisy in (
+    "aiortc.rtcrtpreceiver",
+    "aiortc.rtcrtpsender",
+    "aiortc.rtcdtlstransport",
+    "aiortc.rtcsctptransport",
+    "aiortc.rtcdatachannel",
+    "aiortc.rtcicetransport",
+    "aiortc.rtcpeerconnection",
+    "aioice.ice",
+    "aioice.turn",
+    "websockets.client",
+    "websockets.server",
+):
+    logging.getLogger(_noisy).setLevel(
+        getattr(logging, _noisy_log_level, logging.WARNING)
+    )
+
 logger = logging.getLogger("main")
 
 BIRDFY_EMAIL    = os.environ["BIRDFY_EMAIL"]

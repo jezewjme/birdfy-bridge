@@ -301,12 +301,16 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                     nal_types,
                 )
 
-            # Big frames are keyframe-sized. Log every big frame's shape + whether
-            # it parsed, plus a running tally, so a failed run still shows whether
-            # keyframes are arriving clean now. (Cheap: big frames are infrequent.)
+            # Big frames are keyframe-sized. A clean keyframe in steady state is
+            # routine, so log it at DEBUG; only escalate to a WARNING when a big
+            # frame is garbage (no start code = lost/evicted keyframe head), which
+            # is the failure we care about. Either way include the running tally
+            # so a debug session can see whether keyframes stay clean.
             if len(data) >= BIG_FRAME_BYTES:
                 head = data[:16].hex(" ")
-                logger.info(
+                _level = logging.WARNING if is_garbage else logging.DEBUG
+                logger.log(
+                    _level,
                     "RTP forwarder: BIG frame %d bytes head=%s start_code=%s "
                     "nal_types=%s garbage=%s (tally: frames=%d garbage=%d idr=%d)",
                     len(data),
