@@ -68,8 +68,12 @@ def _path_ready() -> bool:
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, OSError, ValueError):
         return False
-    # MediaMTX v3: {"name": "...", "ready": true, "source": {...}, ...}
-    return bool(data.get("ready"))
+    # MediaMTX v3 Path: {"name": ..., "ready": bool, "readyTime": str|null, ...}.
+    # `ready` is marked deprecated in newer MediaMTX in favor of `readyTime` (a
+    # non-null timestamp once publishing), so accept either to stay forward-compatible.
+    if data.get("ready") is True:
+        return True
+    return data.get("readyTime") is not None
 
 
 def _read_down_since() -> float | None:
