@@ -9,6 +9,13 @@ logDestinations: [stdout]
 rtspAddress: :8554
 rtspTransports: [tcp, udp]
 
+# Control API — used ONLY by the container healthcheck to ask whether the
+# 'birdfy' path is actively publishing (ready:true). Bound to localhost so it is
+# never reachable off the container; no metrics/pprof exposed. See Dockerfile
+# HEALTHCHECK and the grace-period logic in docker/healthcheck.py.
+api: yes
+apiAddress: 127.0.0.1:9997
+
 # Disable protocols we don't need.
 rtmp: no
 hls: no

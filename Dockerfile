@@ -55,6 +55,7 @@ COPY *.py /app/
 
 # --- s6 service definitions + MediaMTX config ---------------------------------------
 COPY docker/mediamtx.yml /etc/mediamtx.yml
+COPY docker/healthcheck.py /app/healthcheck.py
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
 
 # Unbuffered stdout so logs appear immediately under s6
@@ -64,17 +65,16 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8554/tcp 8554/udp
 
-# Healthcheck: probe TCP reachability of the RTSP port — if MediaMTX is dead the
-# bridge has nowhere to publish to. We must NOT speak HTTP here: 8554 is RTSP, so
-# `curl http://localhost:8554/` makes MediaMTX log "invalid HTTP request" and
-# returns non-2xx, which made `curl -fsS` always fail and pinned the container in
-# "starting"/"unhealthy" even while the bridge was working. Instead do a raw TCP
-# connect using the Python interpreter that's guaranteed present in this image
-# (no dependence on bash /dev/tcp, nc, or curl). Succeeds iff something is
-# listening on 8554. Doesn't verify the bridge is actively publishing (that needs
-# the MediaMTX HTTP API); keep it cheap.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import socket; socket.create_connection(('localhost',8554),3).close()" \
-        || exit 1
+# Healthcheck: grace-period publish check (docker/healthcheck.py). It reports
+# UNHEALTHY if MediaMTX is dead (immediate) OR if the 'birdfy' path has not been
+# publishing for a sustained window (default 5 min, HEALTHCHECK_GRACE_SEC). A
+# brief reconnect or feeder-camera sleep stays HEALTHY, so a working container is
+# never restarted by a normal republish — but a true "connected yet never
+# published" hang (or a long-dead stream) now surfaces as unhealthy instead of
+# the old TCP-only check that reported healthy regardless. Uses MediaMTX's local
+# control API (127.0.0.1:9997, enabled in docker/mediamtx.yml) plus a raw TCP
+# liveness probe; stdlib-only, no extra deps.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python /app/healthcheck.py || exit 1
 
 ENTRYPOINT ["/init"]
