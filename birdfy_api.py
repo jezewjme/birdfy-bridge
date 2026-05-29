@@ -111,6 +111,14 @@ class AuthExpiredError(RuntimeError):
     """Raised when a cached token is rejected by an authenticated API call."""
 
 
+class RefreshFailedError(RuntimeError):
+    """Raised when a refreshToken-based renewal is rejected or unavailable.
+
+    Distinct from AuthExpiredError so the resume path can tell "refresh isn't
+    going to work, fall through to a full login" apart from a transient error.
+    """
+
+
 def _load_cached_auth() -> dict | None:
     """Return the cached auth dict if present and parseable, else None."""
     if os.getenv("NVS_NO_TOKEN_CACHE"):
@@ -139,7 +147,9 @@ def _save_cached_auth(data: dict, email: str) -> None:
         return
     try:
         to_store = dict(data)
-        to_store["_cached_email"] = email
+        # Don't clobber a previously-stored email with an empty one (the refresh
+        # path passes "" and relies on the email already carried in `data`).
+        to_store["_cached_email"] = email or data.get("_cached_email")
         to_store["_cached_at"] = int(time.time())
         # Write then chmod (write_text won't set mode on existing files).
         _AUTH_CACHE_FILE.write_text(json.dumps(to_store), encoding="utf-8")
@@ -298,6 +308,116 @@ async def login(email: str, password: str) -> dict:
             raise RuntimeError(f"Auth request failed: {e}") from e
 
 
+async def refresh_token(cached: dict) -> dict:
+    """Renew an expired login token using the stored refreshToken — WITHOUT a
+    fresh /users/login/v2 (which is what triggers Netvue's "new device logged in"
+    email).
+
+    The exact refresh endpoint is NOT confirmed from any HAR/pcap capture (the
+    browser session we reverse-engineered never refreshed), so this is best-effort:
+    we try the documented `/auth/refreshtoken` plus a couple of plausible Netvue
+    URL/body shapes, and the caller (login_or_resume) falls back to a full login
+    if every shape fails. If a shape ever succeeds we'll see exactly which one in
+    the log and can pin it.
+
+    On success returns a NEW auth dict (merged onto the cached one so region /
+    localEndpoint / userID survive even if the refresh response is sparse), with
+    the fresh token persisted to the cache.
+
+    Raises RefreshFailedError if no shape yields a usable token.
+    """
+    if os.getenv("NVS_NO_TOKEN_REFRESH"):
+        raise RefreshFailedError("token refresh disabled via NVS_NO_TOKEN_REFRESH")
+
+    refresh_tok = cached.get("refreshToken")
+    if not refresh_tok:
+        raise RefreshFailedError("cached auth has no refreshToken")
+
+    token = cached.get("token", "")
+    user_id = str(cached.get("userID", ""))
+    local_endpoint = cached.get("localEndpoint", "")
+    if not local_endpoint:
+        region = cached.get("region", "us-east-1")
+        local_endpoint = f"https://{region}-localweb.nvts.co"
+
+    # Candidate (url, body) shapes to try, most-likely first. Auth is the NVS
+    # signature chain (same as every other authenticated call); the refreshToken
+    # rides in the body. We do NOT send the password, so this never counts as a
+    # new login. Keep these data-driven so adding a shape from a future capture
+    # is a one-line change.
+    candidates = [
+        (f"{local_endpoint}/v1/auth/refreshtoken", {"refreshToken": refresh_tok}),
+        (f"{AUTH_BASE}/auth/refreshtoken", {"refreshToken": refresh_tok}),
+        (f"{local_endpoint}/v1/users/refreshtoken", {"refreshToken": refresh_tok}),
+        (f"{local_endpoint}/v1/users/token/refresh", {"refreshToken": refresh_tok}),
+    ]
+
+    headers = _nvs_headers(token=token, user_id=user_id)
+
+    async with aiohttp.ClientSession() as session:
+        last_status = None
+        last_text = ""
+        for url, body in candidates:
+            try:
+                logger.info("AUTH REFRESH -> %s", url)
+                async with session.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    last_status = resp.status
+                    last_text = await resp.text()
+                    logger.debug("  HTTP %s: %s", resp.status, _redact_response(last_text))
+                    if resp.status not in (200, 201):
+                        logger.info(
+                            "  refresh shape %s -> HTTP %s, trying next", url, resp.status
+                        )
+                        continue
+                    try:
+                        parsed = json.loads(last_text)
+                    except ValueError:
+                        continue
+                    data = parsed.get("data") or parsed
+                    # A non-zero wrapper code means the endpoint exists but
+                    # rejected the refreshToken — no point trying other shapes.
+                    code = data.get("code", parsed.get("code", 0))
+                    new_token = data.get("token") or data.get("accessToken")
+                    if not new_token:
+                        if code in (401, 403, 1002, 1003):
+                            raise RefreshFailedError(
+                                f"refreshToken rejected (code={code})"
+                            )
+                        continue
+                    # Merge so a sparse refresh response keeps region/endpoint/etc.
+                    merged = dict(cached)
+                    merged.update(data)
+                    merged["token"] = new_token
+                    # A refresh may or may not rotate the refreshToken; keep the
+                    # new one if given, else retain the old.
+                    if not data.get("refreshToken"):
+                        merged["refreshToken"] = refresh_tok
+                    global _auth_state
+                    _auth_state = merged
+                    _save_cached_auth(merged, cached.get("_cached_email") or "")
+                    logger.info(
+                        "Token refreshed via %s — no fresh login needed (userID=%s)",
+                        url,
+                        merged.get("userID"),
+                    )
+                    return merged
+            except RefreshFailedError:
+                raise
+            except Exception as e:
+                logger.info("  refresh shape %s raised %s, trying next", url, e)
+                continue
+
+    raise RefreshFailedError(
+        f"no refresh endpoint shape succeeded (last HTTP {last_status}: "
+        f"{_redact_response(last_text, limit=200)})"
+    )
+
+
 async def login_or_resume(email: str, password: str) -> tuple[dict, list]:
     """Authenticate, reusing a cached token if one is still valid.
 
@@ -327,8 +447,28 @@ async def login_or_resume(email: str, password: str) -> tuple[dict, list]:
             )
             return cached, devices
         except AuthExpiredError as e:
-            logger.info("Cached token rejected (%s) — doing a fresh login.", e)
-            _clear_cached_auth()
+            # Token lapsed. Try a refreshToken-based renewal first — that avoids
+            # the "new device logged in" email that a full login sends. Only fall
+            # back to login() if refresh is unavailable or rejected.
+            logger.info("Cached token rejected (%s) — attempting token refresh.", e)
+            try:
+                refreshed = await refresh_token(cached)
+                devices = await get_devices(refreshed)
+                _auth_state = refreshed
+                logger.info(
+                    "Reusing refreshed token — no fresh login needed (userID=%s region=%s)",
+                    refreshed.get("userID"),
+                    refreshed.get("region"),
+                )
+                return refreshed, devices
+            except RefreshFailedError as re:
+                logger.info("Token refresh failed (%s) — doing a fresh login.", re)
+                _clear_cached_auth()
+            except AuthExpiredError as re:
+                # Refresh produced a token the device-list call still rejected —
+                # treat as a hard failure and re-login.
+                logger.info("Refreshed token also rejected (%s) — doing a fresh login.", re)
+                _clear_cached_auth()
         except Exception as e:
             # Network/other error: don't burn a fresh login (and a "new device"
             # email) on a transient failure — surface it so the caller's retry

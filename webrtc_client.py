@@ -275,8 +275,21 @@ async def connect_and_stream(
                 # decoder thread's output queue backs up and may block the
                 # decoder worker. _drain() is a no-op consumer.
                 asyncio.ensure_future(_drain(track))
+                # Grab the audio receiver (its transceiver was added up-front, so
+                # it exists regardless of whether the audio on("track") has fired
+                # yet) and hand it to the forwarder for PCMU passthrough muxing.
+                audio_receiver = next(
+                    (t.receiver for t in pc.getTransceivers()
+                     if t.kind == "audio" and t.receiver is not None),
+                    None,
+                )
                 asyncio.ensure_future(
-                    forward_video(receiver, rtsp_output, frame_timeout=FRAME_TIMEOUT)
+                    forward_video(
+                        receiver,
+                        rtsp_output,
+                        frame_timeout=FRAME_TIMEOUT,
+                        audio_receiver=audio_receiver,
+                    )
                 )
                 # Periodic re-NACK: aiortc requests a missing packet only once.
                 # Large keyframes (~50-110 packets) can lose their head fragment

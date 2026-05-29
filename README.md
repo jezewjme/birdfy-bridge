@@ -105,6 +105,8 @@ This keeps a **single** connection to the bridge (go2rtc derives the substream i
 | `NVS_UDID`       | No       | Stable device UUID for signing (auto-generated and persisted per-host if unset) |
 | `BIRDFY_STATE_DIR`         | No | Directory for the persisted UDID + cached auth token (default: home dir; `compose.yaml` sets `/data`, backed by a volume). See [Token persistence](#token-persistence). |
 | `NVS_NO_TOKEN_CACHE`       | No | Set to disable token caching and always do a fresh login. |
+| `NVS_NO_TOKEN_REFRESH`     | No | Set to disable the `refreshToken`-based renewal on token expiry (falls straight back to a full login). |
+| `BIRDFY_AUDIO`             | No | `0` to disable PCMU audio passthrough (video-only). Default on. POSIX-only; auto-disables elsewhere. |
 | `BIRDFY_FRAME_RATE`        | No | Constant output frame rate fed to ffmpeg (default: `15`, the camera's negotiated rate). See [RTP receive-path quirks](#rtp-receive-path-quirks). |
 | `BIRDFY_JITTER_CAPACITY`   | No | aiortc video jitter buffer size, power of 2 (default: `2048`). Widened to fit large keyframes. |
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
@@ -133,8 +135,8 @@ Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 
 - **KVS WebRTC path**: `onAddx: false` devices (some newer outdoor cameras) use AWS Kinesis Video Streams. Currently raises `NotImplementedError`. Contributions welcome.
 - **Initial keyframe latency**: After the data channel opens, the camera takes a few seconds to send the first keyframe. The bridge sends RTCP PLI/FIR to nudge it, but the first decodable frame still lags connection by a few seconds.
-- **Token refresh**: The login token has an expiry. The bridge currently re-authenticates on disconnect; the `/auth/refreshtoken` endpoint isn't used.
-- **Audio**: Audio track is received but not muxed into the RTSP output (video-only).
+- **Token refresh**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes and is best-effort — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
+- **Audio**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
 - **Publish-level healthcheck**: The container healthcheck only verifies MediaMTX is listening, not that the stream is actively publishing — by design (see [RTP receive-path quirks](#rtp-receive-path-quirks)).
 
 ## How it works

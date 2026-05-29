@@ -26,6 +26,21 @@ import tempfile
 
 from aiortc.jitterbuffer import JitterBuffer, JitterFrame
 
+# Audio passthrough is opt-out: the camera sends a PCMU (G.711 µ-law, 8 kHz mono)
+# track that aiortc depayloads to raw µ-law sample bytes. We mux that into the
+# RTSP output as a second ffmpeg input with -c:a copy (no re-encode — PCMU is a
+# native RTP/RTSP payload type). Set BIRDFY_AUDIO=0 to fall back to video-only.
+AUDIO_ENABLED = os.getenv("BIRDFY_AUDIO", "1") not in ("0", "false", "False", "")
+# Camera audio is PCMU/8000/1ch (confirmed in SDP_ANSWER: a=rtpmap:0 PCMU/8000).
+# These describe the raw bytes we pipe to ffmpeg's audio input; override only if
+# a future device negotiates a different G.711 variant or clock rate.
+AUDIO_SAMPLE_FMT = os.getenv("BIRDFY_AUDIO_FORMAT", "mulaw")  # ffmpeg -f value
+AUDIO_SAMPLE_RATE = int(os.getenv("BIRDFY_AUDIO_RATE", "8000"))
+AUDIO_CHANNELS = int(os.getenv("BIRDFY_AUDIO_CHANNELS", "1"))
+# fd number ffmpeg reads the audio pipe from (pipe:3). Must not collide with
+# 0/1/2 (stdin/stdout/stderr).
+_AUDIO_FD = 3
+
 logger = logging.getLogger(__name__)
 
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
@@ -188,7 +203,7 @@ def _unwrap_jitter_buffer(receiver) -> None:
         pass
 
 
-def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
+def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subprocess.Popen:
     """Start ffmpeg in H264-passthrough mode writing to RTSP.
 
     Timestamps: the raw Annex B stream we feed in has no container timing. We
@@ -202,6 +217,14 @@ def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
     camera's negotiated stream is 15 fps (confirmed in ffmpeg input probe).
 
     -c copy: no re-encode (the whole point of this path).
+
+    audio_read_fd: if given, ffmpeg reads raw PCMU (µ-law) audio from this fd as a
+    second input (pipe:<fd>) and copies it into the RTSP output (-c:a copy). The
+    fd is inherited by the child via Popen(pass_fds=...). We let ffmpeg derive the
+    audio PTS from the sample clock (-f mulaw -ar 8000): that is naturally
+    monotonic and starts at 0, matching the video's genpts-from-0, so the two
+    inputs stay roughly aligned without a separate wall-clock. Passing None keeps
+    the original video-only behavior byte-for-byte.
     """
     cmd = [
         "ffmpeg", "-y",
@@ -212,12 +235,29 @@ def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
         "-r", str(FRAME_RATE),
         "-f", "h264",
         "-i", "pipe:0",
+    ]
+    if audio_read_fd is not None:
+        cmd += [
+            # Raw G.711 µ-law has no header; declare format/rate/channels so
+            # ffmpeg derives a clean sample-clock PTS starting at 0.
+            "-f", AUDIO_SAMPLE_FMT,
+            "-ar", str(AUDIO_SAMPLE_RATE),
+            "-ac", str(AUDIO_CHANNELS),
+            "-i", f"pipe:{audio_read_fd}",
+        ]
+    cmd += [
         "-c:v", "copy",
         # Constant frame rate output: pad/drop to keep DTS strictly monotonic so
         # downstream (Frigate) sees a stable rate and doesn't fps-cap-kill us.
         "-fps_mode", "cfr",
         "-r", str(FRAME_RATE),
-        "-an",
+    ]
+    if audio_read_fd is not None:
+        # PCMU is a native RTP/RTSP payload — copy it through, no re-encode.
+        cmd += ["-c:a", "copy", "-map", "0:v:0", "-map", "1:a:0"]
+    else:
+        cmd += ["-an"]
+    cmd += [
         "-f", "rtsp",
         "-rtsp_transport", "tcp",
         rtsp_output,
@@ -228,7 +268,70 @@ def _start_ffmpeg(rtsp_output: str) -> subprocess.Popen:
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=open(_FFMPEG_LOG_PATH, "w"),
+        pass_fds=() if audio_read_fd is None else (audio_read_fd,),
     )
+
+
+class _AudioPump:
+    """Owns the OS pipe that carries µ-law audio to one ffmpeg instance and the
+    background task that drains the audio frame queue into it.
+
+    One pump is created per ffmpeg (re)start and closed when that ffmpeg is reaped,
+    so the write end never outlives its reader. The read end is handed to ffmpeg
+    via pass_fds and closed in the parent right after Popen (the child keeps it).
+    """
+
+    def __init__(self, queue: asyncio.Queue[bytes]) -> None:
+        self._queue = queue
+        self.read_fd, self._write_fd = os.pipe()
+        self._writer: asyncio.Task | None = None
+        self._closed = False
+
+    def start_writer(self) -> None:
+        self._writer = asyncio.ensure_future(self._pump())
+
+    def close_read_fd_in_parent(self) -> None:
+        """After Popen the child owns the read end; the parent must drop its copy
+        or ffmpeg never sees EOF when we close the write end."""
+        try:
+            os.close(self.read_fd)
+        except OSError:
+            pass
+
+    async def _pump(self) -> None:
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                data = await self._queue.get()
+                if data is None:  # sentinel — shutdown
+                    return
+                try:
+                    # os.write can short-write on a full pipe; loop. Run in the
+                    # executor so a momentarily-full pipe doesn't block the loop.
+                    await loop.run_in_executor(None, _write_all, self._write_fd, data)
+                except (BrokenPipeError, OSError):
+                    return
+        except asyncio.CancelledError:
+            return
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._writer is not None and not self._writer.done():
+            self._writer.cancel()
+        try:
+            os.close(self._write_fd)
+        except OSError:
+            pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of `data` to `fd`, retrying short writes."""
+    mv = memoryview(data)
+    while mv:
+        n = os.write(fd, mv)
+        mv = mv[n:]
 
 
 def _reap_ffmpeg(proc: subprocess.Popen | None) -> None:
@@ -249,11 +352,21 @@ def _reap_ffmpeg(proc: subprocess.Popen | None) -> None:
             proc.kill()
 
 
-async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0) -> None:
+async def forward_video(
+    receiver,
+    rtsp_output: str,
+    frame_timeout: float = 90.0,
+    audio_receiver=None,
+) -> None:
     """Pump depayloaded H264 frames from `receiver` to ffmpeg → RTSP.
 
     Returns when no frame has arrived for `frame_timeout` seconds, when ffmpeg
     dies, or when the caller cancels.
+
+    audio_receiver: if given (and BIRDFY_AUDIO not disabled), the camera's PCMU
+    audio track is tapped the same way as video and muxed into the RTSP output
+    via a second ffmpeg input (-c:a copy). The video path is unchanged when no
+    audio receiver is supplied or audio is disabled.
     """
     queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
 
@@ -268,6 +381,58 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
             logger.warning("RTP forwarder queue full — dropping frame")
 
     _wrap_jitter_buffer(receiver, _on_frame)
+
+    # ── Audio tap (optional) ──────────────────────────────────────────────────
+    # The audio queue is filled continuously from the moment the track is tapped;
+    # an _AudioPump (created per ffmpeg start) drains it into ffmpeg's audio pipe.
+    # While no ffmpeg is running the queue just buffers/drops — bounded so a long
+    # pre-IDR wait can't grow it without limit.
+    # pass_fds (used to hand the audio pipe to ffmpeg) is POSIX-only. The bridge
+    # ships in a Linux container; on a non-POSIX dev host degrade to video-only
+    # rather than crash on Popen(pass_fds=...).
+    audio_enabled = AUDIO_ENABLED and audio_receiver is not None and os.name == "posix"
+    if AUDIO_ENABLED and audio_receiver is not None and os.name != "posix":
+        logger.warning(
+            "RTP forwarder: audio passthrough needs POSIX (pass_fds) — video-only on %s",
+            os.name,
+        )
+    audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=512)
+    audio_frames_seen = 0
+    audio_pump: _AudioPump | None = None
+
+    if audio_enabled:
+        def _on_audio(jf: JitterFrame) -> None:
+            nonlocal audio_frames_seen
+            if not jf.data:
+                return
+            audio_frames_seen += 1
+            try:
+                audio_queue.put_nowait(jf.data)
+            except asyncio.QueueFull:
+                # Drop oldest so we favor fresh audio (avoids unbounded a/v skew
+                # if ffmpeg isn't draining yet).
+                try:
+                    audio_queue.get_nowait()
+                    audio_queue.put_nowait(jf.data)
+                except asyncio.QueueEmpty:
+                    pass
+
+        try:
+            _wrap_jitter_buffer(audio_receiver, _on_audio)
+            logger.info("RTP forwarder: audio passthrough enabled (PCMU -> -c:a copy)")
+        except Exception as e:
+            audio_enabled = False
+            logger.warning("RTP forwarder: could not tap audio receiver (%s) — video-only", e)
+
+    def _start_av_ffmpeg() -> tuple[subprocess.Popen, _AudioPump | None]:
+        """Start ffmpeg, wiring an audio pump iff audio is enabled."""
+        if not audio_enabled:
+            return _start_ffmpeg(rtsp_output), None
+        pump = _AudioPump(audio_queue)
+        p = _start_ffmpeg(rtsp_output, audio_read_fd=pump.read_fd)
+        pump.close_read_fd_in_parent()
+        pump.start_writer()
+        return p, pump
 
     proc: subprocess.Popen | None = None
     params = _ParamSetCache()
@@ -393,11 +558,12 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                             idr_frames_seen,
                         )
                     continue
-                proc = _start_ffmpeg(rtsp_output)
+                proc, audio_pump = _start_av_ffmpeg()
                 logger.info(
-                    "RTP forwarder: ffmpeg started after %d pre-IDR drops, first IDR frame %d bytes",
+                    "RTP forwarder: ffmpeg started after %d pre-IDR drops, first IDR frame %d bytes (audio=%s)",
                     pre_proc_frames_dropped,
                     len(data),
+                    audio_enabled,
                 )
 
             if proc.poll() is not None:
@@ -407,6 +573,9 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                 )
                 _log_ffmpeg_tail()
                 _reap_ffmpeg(proc)
+                if audio_pump is not None:
+                    audio_pump.close()
+                    audio_pump = None
                 proc = None
                 ffmpeg_restarts += 1
                 # Re-arm the keyframe gate so the fresh ffmpeg starts on a clean
@@ -427,6 +596,9 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
                 logger.warning("RTP forwarder: ffmpeg pipe broken — will restart on next keyframe")
                 _log_ffmpeg_tail()
                 _reap_ffmpeg(proc)
+                if audio_pump is not None:
+                    audio_pump.close()
+                    audio_pump = None
                 proc = None
                 ffmpeg_restarts += 1
                 pre_proc_frames_dropped = 0
@@ -444,7 +616,7 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
         logger.info(
             "RTP forwarder summary: frames_seen=%d garbage(no-start-code)=%d "
             "garbage_skipped=%d idr_total=%d frames_forwarded=%d bytes_forwarded=%d "
-            "ffmpeg_restarts=%d ffmpeg_started=%s",
+            "ffmpeg_restarts=%d audio_frames=%d audio_enabled=%s ffmpeg_started=%s",
             total_frames_seen,
             garbage_frames_seen,
             garbage_frames_skipped,
@@ -452,9 +624,15 @@ async def forward_video(receiver, rtsp_output: str, frame_timeout: float = 90.0)
             frames_in,
             bytes_in,
             ffmpeg_restarts,
+            audio_frames_seen,
+            audio_enabled,
             proc is not None,
         )
+        if audio_pump is not None:
+            audio_pump.close()
         _unwrap_jitter_buffer(receiver)
+        if audio_enabled:
+            _unwrap_jitter_buffer(audio_receiver)
         if proc is not None and proc.poll() is None:
             try:
                 proc.stdin.close()  # type: ignore[union-attr]
