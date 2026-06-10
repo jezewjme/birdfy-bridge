@@ -37,7 +37,7 @@ Run the bridge once with any placeholder DEVICE_ID. The error message lists ever
 
 ```
 RuntimeError: Device '1234567890123456' not found. Available devices:
-  ['5372540233101051 / addxSn=AB12CD34 (Bamboo Feeder)', ...]
+  ['1234567890123456 / addxSn=AB12CD34 (Bamboo Feeder)', ...]
 ```
 
 Copy the matching `serialNumber` into `.env`.
