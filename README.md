@@ -137,7 +137,7 @@ Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 - **Initial keyframe latency**: After the data channel opens, the camera takes a few seconds to send the first keyframe. The bridge sends RTCP PLI/FIR to nudge it, but the first decodable frame still lags connection by a few seconds.
 - **Token refresh**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes and is best-effort — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
 - **Audio**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
-- **Publish-level healthcheck**: The container healthcheck only verifies MediaMTX is listening, not that the stream is actively publishing — by design (see [RTP receive-path quirks](#rtp-receive-path-quirks)).
+- **Publish-level healthcheck**: The container healthcheck verifies the `birdfy` path is actively publishing, with a grace window to tolerate normal reconnects (see [Container healthcheck](#container-healthcheck)).
 
 ## How it works
 
@@ -229,11 +229,16 @@ Fixed in `_rtp_forwarder.py` by declaring the input as constant `BIRDFY_FRAME_RA
 
 ### Container healthcheck
 
-The Docker `HEALTHCHECK` is a deliberately **cheap TCP liveness probe** — a raw TCP connect to MediaMTX's RTSP port 8554 (via the Python interpreter already in the image). It confirms MediaMTX is up so the bridge has somewhere to publish.
+The Docker `HEALTHCHECK` uses MediaMTX's control API (`http://127.0.0.1:9997`) rather than a raw TCP connect to the RTSP port. This avoids generating noise in the MediaMTX RTSP log (each raw TCP connect appeared as an `[::1] opened / closed: EOF` pair).
 
-> Note: an earlier version did `curl http://localhost:8554/`, but 8554 is RTSP, not HTTP — MediaMTX rejected it (`invalid HTTP request`), the probe always failed, and the container was pinned in `starting`/`unhealthy` even while streaming fine.
+The healthcheck operates in layers (see [`docker/healthcheck.py`](docker/healthcheck.py)):
 
-It intentionally does **not** verify that the `birdfy` path is actively publishing. The stream legitimately tears down and republishes during normal Frigate/WebRTC reconnects (and the feeder camera sleeps), so a publish-level healthcheck would flap to `unhealthy` and could restart a working container. If you want publish-level visibility, expose it as separate monitoring (e.g. enable MediaMTX's HTTP API in [`docker/mediamtx.yml`](docker/mediamtx.yml) and poll `/v3/paths/get/birdfy`), not as the container health signal.
+1. **MediaMTX dead** (control API unreachable) → immediate `UNHEALTHY`, no grace.
+2. **`birdfy` path publishing** (`ready: true`) → `HEALTHY`, reset down-timer.
+3. **Not publishing, down < grace window** → `HEALTHY` (tolerate reconnects and camera sleep).
+4. **Not publishing, down ≥ grace window** → `UNHEALTHY`.
+
+The grace window (default 5 minutes, `HEALTHCHECK_GRACE_SEC`) prevents the normal WebRTC reconnect / feeder-camera sleep cycle from restarting a working container. A container that never publishes, or whose stream dies and stays dead, will eventually go `UNHEALTHY`.
 
 ## Development
 

@@ -16,7 +16,7 @@ reconnect/sleep stays healthy; a true never-came-up or long-dead stream goes
 unhealthy.
 
 Layers:
-  1. MediaMTX dead (RTSP port not listening)      -> immediate UNHEALTHY (no grace).
+  1. MediaMTX dead (control API unreachable)      -> immediate UNHEALTHY (no grace).
   2. 'birdfy' publishing (ready:true)             -> HEALTHY, reset down-timer.
   3. Not publishing, but down < grace window      -> HEALTHY (tolerate reconnects).
   4. Not publishing, and down >= grace window     -> UNHEALTHY.
@@ -24,12 +24,10 @@ Layers:
 Stdlib only (no pip deps in the healthcheck path). Tunables via env:
   HEALTHCHECK_PATH        RTSP/MediaMTX path name        (default: birdfy)
   HEALTHCHECK_API         MediaMTX control API base      (default: http://127.0.0.1:9997)
-  HEALTHCHECK_RTSP_PORT   RTSP TCP port for liveness     (default: 8554)
   HEALTHCHECK_GRACE_SEC   down-duration before unhealthy (default: 300 = 5 min)
 """
 import json
 import os
-import socket
 import sys
 import time
 import urllib.error
@@ -37,7 +35,6 @@ import urllib.request
 
 PATH_NAME = os.getenv("HEALTHCHECK_PATH", os.getenv("RTSP_PATH", "birdfy"))
 API_BASE = os.getenv("HEALTHCHECK_API", "http://127.0.0.1:9997").rstrip("/")
-RTSP_PORT = int(os.getenv("HEALTHCHECK_RTSP_PORT", "8554"))
 GRACE_SEC = int(os.getenv("HEALTHCHECK_GRACE_SEC", "300"))
 
 # Persisted "stream first seen down at" timestamp. /tmp is fine — it only needs to
@@ -46,11 +43,13 @@ GRACE_SEC = int(os.getenv("HEALTHCHECK_GRACE_SEC", "300"))
 _STATE_FILE = "/tmp/birdfy_healthcheck_down_since"
 
 
-def _rtsp_listening() -> bool:
+def _api_alive() -> bool:
+    """True iff the MediaMTX control API responds — uses HTTP, not a raw RTSP
+    TCP connect, so it never generates noise in the MediaMTX RTSP log."""
     try:
-        socket.create_connection(("localhost", RTSP_PORT), 3).close()
-        return True
-    except OSError:
+        with urllib.request.urlopen(f"{API_BASE}/v3/config/global/get", timeout=3) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, OSError):
         return False
 
 
@@ -101,9 +100,10 @@ def _clear_down_since() -> None:
 
 def main() -> int:
     # Layer 1: MediaMTX itself must be up. If it's not, nothing can publish — hard
-    # fail immediately (no grace), matching the old TCP-liveness behavior.
-    if not _rtsp_listening():
-        print(f"UNHEALTHY: RTSP port {RTSP_PORT} not listening (MediaMTX down)")
+    # fail immediately (no grace). Uses the control API rather than a raw RTSP TCP
+    # connect so it doesn't generate noise in the MediaMTX RTSP log.
+    if not _api_alive():
+        print(f"UNHEALTHY: MediaMTX control API {API_BASE} unreachable")
         return 1
 
     # Layer 2: actively publishing -> healthy, reset the down-timer.
