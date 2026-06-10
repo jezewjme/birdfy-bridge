@@ -72,8 +72,8 @@ EXPOSE 8554/tcp 8554/udp
 # never restarted by a normal republish — but a true "connected yet never
 # published" hang (or a long-dead stream) now surfaces as unhealthy instead of
 # the old TCP-only check that reported healthy regardless. Uses MediaMTX's local
-# control API (127.0.0.1:9997, enabled in docker/mediamtx.yml) plus a raw TCP
-# liveness probe; stdlib-only, no extra deps.
+# control API (127.0.0.1:9997, enabled in docker/mediamtx.yml) for both the
+# liveness and publish checks; stdlib-only, no extra deps.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python /app/healthcheck.py || exit 1
 

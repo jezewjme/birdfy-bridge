@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Token refresh**: when a cached token is rejected, the bridge now tries a
+  `refreshToken`-based renewal (`birdfy_api.refresh_token`) before falling back
+  to a full login — avoiding Netvue's "new device logged in" email on token
+  expiry. The refresh endpoint shape is unverified from captures, so it is
+  best-effort (tries a few plausible URLs) with the full login as backstop.
+  Disable with `NVS_NO_TOKEN_REFRESH=1`.
+- **Audio**: the camera's PCMU (G.711 µ-law, 8 kHz mono) audio track is now
+  muxed into the RTSP output via a second ffmpeg input with `-c:a copy` (no
+  re-encode). POSIX-only (uses `pass_fds`); degrades to video-only elsewhere.
+  Disable with `BIRDFY_AUDIO=0`.
+
+### Fixed
+- Removed conflicting duplicate definitions of `BIG_FRAME_BYTES` /
+  `MAX_GARBAGE_DUMPS` in `_rtp_forwarder.py` (the later pair silently won).
+- The parent process no longer leaks a file handle for ffmpeg's stderr log on
+  every ffmpeg (re)start.
+- The auth token cache file is created with `0600` permissions from the start
+  (previously written, then chmodded — a brief default-umask window).
+- `Ctrl-C` now exits cleanly instead of dumping a `KeyboardInterrupt` traceback.
+- `test_api.py` used the websockets ≥14 `additional_headers` kwarg, which
+  doesn't exist in the pinned `<14` legacy client.
+
 ## [0.1.0] — Initial public release
 
 First public snapshot. The bridge has been used continuously against a real

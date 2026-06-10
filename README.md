@@ -8,13 +8,13 @@ An interoperability tool that converts a Birdfy / Netvue camera's WebRTC stream 
 
 ## Status
 
-**Working** — the Birdfy Feeder Bamboo streams reliably into Frigate over RTSP via the bundled MediaMTX. The WebRTC handshake, keyframe recovery, and timestamp handling are all confirmed against live captures. Known rough edges are listed under [What's not done](#whats-not-done).
+**Working** — the Birdfy Feeder Bamboo streams reliably into Frigate over RTSP via the bundled MediaMTX. The WebRTC handshake, keyframe recovery, and timestamp handling are all confirmed against live captures. Known rough edges are listed under [Limitations and caveats](#limitations-and-caveats).
 
 ## Supported cameras
 
 - **Birdfy Feeder Bamboo** (confirmed)
 - Other Addx-based Birdfy / Netvue cameras (`onAddx: true` in the device list) should work; please open an issue if you try one.
-- Newer KVS-based devices (`onAddx: false`) are not yet supported — see [What's not done](#whats-not-done).
+- Newer KVS-based devices (`onAddx: false`) are not yet supported — see [Limitations and caveats](#limitations-and-caveats).
 
 ## Quick start (Docker)
 
@@ -33,14 +33,14 @@ The container bundles [MediaMTX](https://github.com/bluenviron/mediamtx) as an i
 
 ### Finding your DEVICE_ID
 
-Run the bridge once with any placeholder DEVICE_ID. The error message lists every device on your account with its serial number:
+`DEVICE_ID` is optional — if it's unset (or doesn't match), the bridge falls back to the **first device on the account** and logs a warning listing every device with its serial number:
 
 ```
-RuntimeError: Device '1234567890123456' not found. Available devices:
-  ['1234567890123456 / addxSn=AB12CD34 (Bamboo Feeder)', ...]
+Device '1234567890123456' not found — falling back to first device.
+Available: ['1234567890123456 / addxSn=AB12CD34 (Bamboo Feeder)', ...]
 ```
 
-Copy the matching `serialNumber` into `.env`.
+If the account has more than one camera, copy the matching `serialNumber` into `.env` to pin the right one.
 
 ### Pointing Frigate at the bridge
 
@@ -94,7 +94,7 @@ This keeps a **single** connection to the bridge (go2rtc derives the substream i
 |------------------|----------|-------------|
 | `BIRDFY_EMAIL`   | Yes      | Netvue / Birdfy account email |
 | `BIRDFY_PASSWORD`| Yes      | Account password (plain text, MD5'd internally) |
-| `DEVICE_ID`      | Yes      | Camera serial number (see [Finding your DEVICE_ID](#finding-your-device_id)) |
+| `DEVICE_ID`      | No       | Camera serial number; defaults to the first device on the account (see [Finding your DEVICE_ID](#finding-your-device_id)) |
 | `RTSP_OUTPUT`    | No       | Full RTSP push URL. If unset, built from `RTSP_HOST` + `RTSP_PATH`. |
 | `RTSP_HOST`      | No       | RTSP server host:port (default: `localhost:8554` — the bundled MediaMTX) |
 | `RTSP_PATH`      | No       | RTSP stream path (default: `birdfy`) |
@@ -131,13 +131,13 @@ Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 - **DEBUG logs may still contain non-secret identifying data** (device serials, region info, ICE server URLs). Bearer tokens, signed URLs, refresh tokens, and AWS credentials are redacted, but treat DEBUG logs as semi-sensitive when sharing them in bug reports.
 - **Netvue's API is reverse-engineered, not contracted.** It can change at any time. The bridge fails loudly when it does; please open an issue if your account suddenly stops authenticating or device-list returns 4xx.
 
-## What's not done
+## Limitations and caveats
 
-- **KVS WebRTC path**: `onAddx: false` devices (some newer outdoor cameras) use AWS Kinesis Video Streams. Currently raises `NotImplementedError`. Contributions welcome.
+- **KVS WebRTC path (not implemented)**: `onAddx: false` devices (some newer outdoor cameras) use AWS Kinesis Video Streams. The bridge exits with an error for these. Contributions welcome.
 - **Initial keyframe latency**: After the data channel opens, the camera takes a few seconds to send the first keyframe. The bridge sends RTCP PLI/FIR to nudge it, but the first decodable frame still lags connection by a few seconds.
-- **Token refresh**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes and is best-effort — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
-- **Audio**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
-- **Publish-level healthcheck**: The container healthcheck verifies the `birdfy` path is actively publishing, with a grace window to tolerate normal reconnects (see [Container healthcheck](#container-healthcheck)).
+- **Token refresh is best-effort**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
+- **Audio is POSIX-only**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
+- **Healthcheck grace window**: The container healthcheck verifies the `birdfy` path is actively publishing, with a grace window to tolerate normal reconnects — a dead stream takes up to ~5 minutes to surface as unhealthy (see [Container healthcheck](#container-healthcheck)).
 
 ## How it works
 

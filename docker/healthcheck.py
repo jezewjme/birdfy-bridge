@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Container healthcheck for birdfy-bridge — grace-period publish check.
 
-History (see memory project_healthcheck_rtsp_port): the healthcheck used to be a
-bare TCP connect to the RTSP port. That never flapped, but it reported HEALTHY
+History: the healthcheck used to be a bare TCP connect to the RTSP port. That never flapped, but it reported HEALTHY
 even when the bridge connected yet never published (e.g. ffmpeg hung opening a
 second input -> MediaMTX "no stream is available"). A strict publish check was
 rejected earlier because the stream legitimately tears down and republishes

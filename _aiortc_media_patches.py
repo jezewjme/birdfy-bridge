@@ -1,8 +1,8 @@
 """
 Runtime monkey-patches for aiortc's media (RTP) receive path.
 
-Problem these fix (confirmed from _birdfy-bridge_logs(8).txt + reading the aiortc
-source):
+Problem these fix (confirmed from captured bridge debug logs + reading the
+aiortc source):
 
   The bridge negotiates H264 fine and RTP flows, but every *keyframe* arrives at
   our forwarder as headerless garbage (no `00 00 00 01` start code anywhere,
