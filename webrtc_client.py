@@ -616,7 +616,7 @@ async def _stream_video(track, rtsp_output: str, state: dict, pc=None):
             try:
                 frame = await asyncio.wait_for(track.recv(), timeout=FRAME_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("No video frames for 30s — reconnecting")
+                logger.warning(f"No video frames for {FRAME_TIMEOUT}s — reconnecting")
                 break
 
             w, h = frame.width, frame.height
@@ -738,12 +738,15 @@ def _start_ffmpeg(width: int, height: int, rtsp_output: str) -> subprocess.Popen
         rtsp_output,
     ]
     logger.debug(f"ffmpeg cmd: {' '.join(cmd)}")
-    return subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=open(tempfile.gettempdir() + "/ffmpeg_birdfy.log", "w"),
-    )
+    # The child inherits its own copy of the stderr handle; close the parent's
+    # right after Popen so a restart doesn't leak a file handle.
+    with open(tempfile.gettempdir() + "/ffmpeg_birdfy.log", "w") as stderr_log:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_log,
+        )
 
 
 def _kill_ffmpeg(state: dict):

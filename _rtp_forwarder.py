@@ -45,14 +45,6 @@ logger = logging.getLogger(__name__)
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
 _START_CODE = b"\x00\x00\x00\x01"
 
-# Frames at/above this size are keyframe-sized for this camera (~25-52 KB IDRs
-# vs ~1-6 KB P-frames). We log every one in full detail since they're rare and
-# are exactly where the corruption shows up.
-BIG_FRAME_BYTES = 15000
-
-# Cap how many corrupt keyframes we dump to disk per session (avoid filling /tmp).
-MAX_GARBAGE_DUMPS = 5
-
 # The camera's negotiated frame rate (confirmed in ffmpeg's input probe: "15 fps").
 # We feed ffmpeg as constant-rate at this value so output timestamps are clean and
 # Frigate's fps-cap watchdog doesn't tear the stream down. Override via env.
@@ -90,7 +82,8 @@ NAL_AUD = 9
 
 # Frames at/above this size are keyframe-scale for this camera (P-frames are
 # <7 KB; observed keyframes are 25-52 KB). Used to single out keyframe-sized
-# frames for detailed diagnostic logging.
+# frames for detailed diagnostic logging — they're rare, and they are exactly
+# where the corruption shows up.
 BIG_FRAME_BYTES = 12000
 
 # How many distinct corrupt keyframe-sized frames to dump to disk for offline
@@ -275,13 +268,16 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         rtsp_output,
     ]
     logger.info("RTP forwarder ffmpeg: %s", " ".join(cmd))
-    return subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=open(_FFMPEG_LOG_PATH, "w"),
-        pass_fds=() if audio_read_fd is None else (audio_read_fd,),
-    )
+    # The child inherits its own copy of the stderr handle; close the parent's
+    # right after Popen so each ffmpeg (re)start doesn't leak a file handle.
+    with open(_FFMPEG_LOG_PATH, "w") as stderr_log:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_log,
+            pass_fds=() if audio_read_fd is None else (audio_read_fd,),
+        )
 
 
 class _AudioPump:
