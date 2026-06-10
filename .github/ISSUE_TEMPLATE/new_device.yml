@@ -1,0 +1,38 @@
+name: New device support
+description: Request or report partial work for a Birdfy / Netvue device the bridge doesn't yet handle.
+labels: ["new-device"]
+body:
+  - type: checkboxes
+    id: ownership
+    attributes:
+      label: Camera ownership
+      options:
+        - label: I own this camera and the Birdfy account associated with it.
+          required: true
+  - type: input
+    id: model
+    attributes:
+      label: Camera model
+    validations:
+      required: true
+  - type: textarea
+    id: device-entry
+    attributes:
+      label: Device list entry (redact your serial)
+      description: |
+        Run the bridge with any placeholder `DEVICE_ID`. The error log prints the available devices. Paste the JSON-ish dump for your camera here, with the serial number masked (e.g. `537254...1051`).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: onaddx
+    attributes:
+      label: "`onAddx` value"
+      placeholder: "true or false"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: HAR captures, web app behavior, links to similar work.

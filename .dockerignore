@@ -1,0 +1,53 @@
+.git/
+.github/
+.gitignore
+.gitattributes
+.dockerignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets / per-machine
+.env
+.env.*
+!.env.example
+
+# Logs and captures
+*.log
+_birdfy-bridge_logs*.txt
+frigate-logs.txt
+*.pcap
+*.pcapng
+*.har
+successful*.json
+captures/
+
+# Repo docs / dev artifacts not needed in the image
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
+HANDOFF.md
+prompt.md
+REVIEW_PROMPT.md
+FINAL_REVIEW_PROMPT.md
+REVIEW_REPORT.md
+patch_aioice.py
+tests/
+test_*.py
+requirements-dev.txt
+
+# IDE / OS
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db

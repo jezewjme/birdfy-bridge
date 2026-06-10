@@ -1,0 +1,27 @@
+services:
+  birdfy-bridge:
+    build: .
+    image: birdfy-bridge:latest
+    container_name: birdfy-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # RTSP — bridge publishes here internally; external consumers (VLC,
+      # Frigate on another host) connect to host:8554. If Frigate runs in
+      # the same compose stack, drop the host mapping and reach the bridge
+      # at rtsp://birdfy-bridge:8554/${RTSP_PATH:-birdfy} over the docker network.
+      - "8554:8554/tcp"
+      - "8554:8554/udp"
+    # Disabling logging to file inside the container — let docker handle it.
+    environment:
+      LOG_FILE: ""
+      # Persist the UDID + cached auth token here so restarts reuse the same
+      # "device" and token instead of doing a fresh login (which triggers
+      # Netvue's "new device logged in" email). Backed by the named volume below.
+      BIRDFY_STATE_DIR: /data
+    volumes:
+      - birdfy-state:/data
+
+volumes:
+  birdfy-state:
