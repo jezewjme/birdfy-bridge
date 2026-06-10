@@ -7,51 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Token refresh**: when a cached token is rejected, the bridge now tries a
-  `refreshToken`-based renewal (`birdfy_api.refresh_token`) before falling back
-  to a full login — avoiding Netvue's "new device logged in" email on token
-  expiry. The refresh endpoint shape is unverified from captures, so it is
-  best-effort (tries a few plausible URLs) with the full login as backstop.
-  Disable with `NVS_NO_TOKEN_REFRESH=1`.
-- **Audio**: the camera's PCMU (G.711 µ-law, 8 kHz mono) audio track is now
-  muxed into the RTSP output via a second ffmpeg input with `-c:a copy` (no
-  re-encode). POSIX-only (uses `pass_fds`); degrades to video-only elsewhere.
-  Disable with `BIRDFY_AUDIO=0`.
+Nothing yet.
 
-### Fixed
-- Removed conflicting duplicate definitions of `BIG_FRAME_BYTES` /
-  `MAX_GARBAGE_DUMPS` in `_rtp_forwarder.py` (the later pair silently won).
-- The parent process no longer leaks a file handle for ffmpeg's stderr log on
-  every ffmpeg (re)start.
-- The auth token cache file is created with `0600` permissions from the start
-  (previously written, then chmodded — a brief default-umask window).
-- `Ctrl-C` now exits cleanly instead of dumping a `KeyboardInterrupt` traceback.
-- The integration smoke-test (`tests/test_api_integration.py`) used the
-  websockets ≥14 `additional_headers` kwarg, which doesn't exist in the pinned
-  `<14` legacy client; corrected to `extra_headers`.
+## [0.1.0] — 2026-06-10
 
-## [0.1.0] — Initial public release
-
-First public snapshot. The bridge has been used continuously against a real
-Birdfy Feeder Bamboo for ~weeks before publication.
+Initial public release. The bridge had been running continuously against a
+real Birdfy Feeder Bamboo for several weeks before publication.
 
 ### What works
 - Addx WebRTC path for `onAddx: true` devices (Birdfy Feeder Bamboo confirmed).
 - Reverse-engineered Netvue `x-nvs-*` signed-header auth (login → device list →
   addx ticket → WebSocket signaling → SDP offer / answer + trickle ICE → H264).
+- **Token caching and refresh**: auth tokens are cached to disk (created `0600`),
+  and when a cached token is rejected the bridge tries a `refreshToken`-based
+  renewal (`birdfy_api.refresh_token`) before falling back to a full login —
+  avoiding Netvue's "new device logged in" email on token expiry. The refresh
+  endpoint shape is unverified from captures, so it is best-effort (tries a few
+  plausible URLs) with the full login as backstop. Disable with
+  `NVS_NO_TOKEN_REFRESH=1`.
+- **RTP passthrough**: H264 RTP frames are forwarded to ffmpeg without
+  transiting aiortc's decoder (`_rtp_forwarder.py`), with SPS/PPS caching,
+  keyframe-gated ffmpeg startup, and PLI/FIR keyframe nudging.
+- **aiortc media patches** (`_aiortc_media_patches.py`): jitter-buffer widening,
+  longer NACK history, and re-NACK on keyframe loss — fixes the garbage
+  keyframes caused by aiortc's 128-packet jitter-buffer eviction.
+- **Audio**: the camera's PCMU (G.711 µ-law, 8 kHz mono) audio track is muxed
+  into the RTSP output via a second ffmpeg input with `-c:a copy` (no
+  re-encode). POSIX-only (uses `pass_fds`); degrades to video-only elsewhere.
+  Disable with `BIRDFY_AUDIO=0`.
 - Camera-compat SDP rewrites (sctpmap injection, sha-384/512 fingerprint strip).
 - Runtime aioice monkey-patches for camera STUN quirks (stale ufrag, single-shot
   nomination, DTLS gating).
-- Docker image with bundled MediaMTX, s6-overlay supervision, multi-arch build
-  (amd64 + arm64).
-- Unit-test suite (NVS signature, SDP patches) — no network required.
+- Stepped reconnect backoff (2 s → 5 min cap, resets after any stable session).
+- Docker image with bundled MediaMTX (version pinned via the `MEDIAMTX_VERSION`
+  build arg), s6-overlay supervision, a publish-aware container healthcheck,
+  and multi-arch build (amd64 + arm64).
+- Unit-test suite (NVS signature, SDP patches, RTP forwarder) — no network
+  required.
 
 ### Not yet implemented
 - KVS WebRTC path for `onAddx: false` devices.
-- RTCP PLI on data-channel open to shorten the ~15s initial-keyframe wait.
-- Token refresh (currently the bridge re-authenticates on disconnect).
-- Audio mux into the RTSP output (video-only).
 
-[Unreleased]: https://github.com/<owner>/birdfy-bridge/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/<owner>/birdfy-bridge/releases/tag/v0.1.0
+[Unreleased]: https://github.com/jezewjme/birdfy-bridge/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jezewjme/birdfy-bridge/releases/tag/v0.1.0
