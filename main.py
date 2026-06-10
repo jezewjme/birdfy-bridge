@@ -22,11 +22,24 @@ Environment variables:
   RTSP_HOST            RTSP server host:port (default: localhost:8554) — used only if RTSP_OUTPUT is unset.
   RTSP_PATH            RTSP stream path (default: birdfy) — used only if RTSP_OUTPUT is unset.
   LOG_LEVEL            DEBUG / INFO / WARNING (default: INFO)
-  LOG_FILE             Path to file for logging output (default: birdfy-bridge.log)
+  LOG_FILE             Path to file for logging output (default: birdfy-bridge.log; empty = stdout only)
+  NOISY_LOG_LEVEL      Floor for chatty aiortc/aioice/websockets loggers (default: WARNING).
+                       Set to DEBUG to get the per-packet firehose back.
+
+  --- Optional: auth/token persistence (see birdfy_api.py) ---
+  BIRDFY_STATE_DIR     Directory for the persisted UDID + cached auth token (default: home dir).
+  NVS_NO_TOKEN_CACHE   Set to disable token caching (always do a fresh login).
+  NVS_NO_TOKEN_REFRESH Set to disable refreshToken-based renewal on expiry (full login instead).
+
+  --- Optional: media (see _rtp_forwarder.py / _aiortc_media_patches.py) ---
+  BIRDFY_AUDIO         0 to disable PCMU audio passthrough (default: on; POSIX-only).
+  BIRDFY_FRAME_RATE    Constant output frame rate fed to ffmpeg (default: 15).
+  BIRDFY_JITTER_CAPACITY / BIRDFY_RTP_HISTORY_SIZE / BIRDFY_NACK_INTERVAL_MS /
+  BIRDFY_NACK_MAX_RETRIES   Keyframe-recovery tunables; see _aiortc_media_patches.py.
 
   --- Optional overrides for NVS signing ---
   NVS_UCID             App client ID (default: 513774810c)
-  NVS_UDID             Device UUID for signing (auto-generated if not set)
+  NVS_UDID             Device UUID for signing (auto-generated and persisted if not set)
 """
 import asyncio
 import logging
@@ -219,4 +232,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down")
