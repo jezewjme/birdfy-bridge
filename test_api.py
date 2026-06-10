@@ -113,7 +113,9 @@ async def test_websocket(ticket: dict):
     try:
         async with websockets.connect(
             url,
-            additional_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
+            # Legacy-client kwarg: requirements.txt pins websockets <14, whose
+            # top-level connect() takes extra_headers (not additional_headers).
+            extra_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
             ping_interval=None,
             open_timeout=10,
         ) as ws:
