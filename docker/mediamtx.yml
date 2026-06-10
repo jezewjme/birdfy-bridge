@@ -1,0 +1,30 @@
+# Minimal MediaMTX config for birdfy-bridge.
+# Accepts publishes from the in-container bridge (ffmpeg pushing to localhost:8554)
+# and serves reads to anything on the container network (VLC, Frigate, etc.).
+# No auth — homelab use. Lock down with publishUser/publishPass if exposing wider.
+
+logLevel: info
+logDestinations: [stdout]
+
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+# Control API — used ONLY by the container healthcheck to ask whether the
+# 'birdfy' path is actively publishing (ready:true). Bound to localhost so it is
+# never reachable off the container; no metrics/pprof exposed. See Dockerfile
+# HEALTHCHECK and the grace-period logic in docker/healthcheck.py.
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# Disable protocols we don't need.
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+
+# Default path config: anyone on the container network can publish or read.
+pathDefaults:
+  source: publisher
+
+paths:
+  all_others:

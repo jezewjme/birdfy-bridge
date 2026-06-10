@@ -1,0 +1,5 @@
+#!/command/execlineb -P
+fdmove -c 2 1
+cd /app
+with-contenv
+/usr/local/bin/python main.py

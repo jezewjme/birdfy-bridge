@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+
+# Secrets / per-machine config
+.env
+.env.*
+!.env.example
+
+# Persisted per-host auth/device state (contains a usable token + device UDID)
+.birdfy_auth_cache.json
+.birdfy_nvs_udid
+
+# Logs (including exported container-log copies saved as .txt)
+*.log
+_birdfy-bridge_logs*.txt
+frigate-logs.txt
+
+# Packet captures and HAR exports from protocol RE — never publish
+*.pcap
+*.pcapng
+*.har
+successful*.json
+captures/
+
+# Local debugging / handoff notes (not for publication)
+HANDOFF.md
+prompt.md
+REVIEW_PROMPT.md
+FINAL_REVIEW_PROMPT.md
+REVIEW_REPORT.md
+patch_aioice.py
+
+# IDE / OS / agent state
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
