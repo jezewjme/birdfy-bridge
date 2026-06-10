@@ -2,6 +2,7 @@ FROM python:3.12-slim-bookworm
 
 ARG TARGETARCH
 ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG MEDIAMTX_VERSION=v1.19.0
 
 # Runtime deps only. aiortc 1.9+ and av 12+ ship manylinux wheels on PyPI for
 # amd64/arm64, so we don't need build toolchains or lib*-dev headers in the
@@ -30,7 +31,10 @@ RUN set -eux; \
         | tar -C / -Jxpf -
 
 # --- MediaMTX (RTSP server) ---------------------------------------------------------
-# Resolves the latest release tag at build time, then pins the download to it.
+# Version is pinned via MEDIAMTX_VERSION build arg (default v1.19.0).
+# Override at build time to pull a different release, e.g.:
+#   docker build --build-arg MEDIAMTX_VERSION=latest ...
+# When "latest" is passed, the version is resolved via the GitHub API at build time.
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
         amd64) MTX_ARCH=linux_amd64 ;; \
@@ -38,7 +42,11 @@ RUN set -eux; \
         arm)   MTX_ARCH=linux_armv7 ;; \
         *) echo "unsupported arch: ${TARGETARCH}"; exit 1 ;; \
     esac; \
-    MTX_VERSION="$(curl -fsSL https://api.github.com/repos/bluenviron/mediamtx/releases/latest | sed -n 's/.*"tag_name":\s*"\([^"]*\)".*/\1/p')"; \
+    if [ "${MEDIAMTX_VERSION}" = "latest" ]; then \
+        MTX_VERSION="$(curl -fsSL https://api.github.com/repos/bluenviron/mediamtx/releases/latest | sed -n 's/.*"tag_name":\s*"\([^"]*\)".*/\1/p')"; \
+    else \
+        MTX_VERSION="${MEDIAMTX_VERSION}"; \
+    fi; \
     echo "Installing MediaMTX ${MTX_VERSION} (${MTX_ARCH})"; \
     curl -fsSL -o /tmp/mediamtx.tar.gz \
         "https://github.com/bluenviron/mediamtx/releases/download/${MTX_VERSION}/mediamtx_${MTX_VERSION}_${MTX_ARCH}.tar.gz"; \

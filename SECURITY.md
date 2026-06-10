@@ -4,7 +4,7 @@
 
 If you find a security issue in birdfy-bridge — credential leak, code-injection vector, anything that lets one user reach another user's Birdfy account — please **do not** open a public GitHub issue.
 
-Instead, open a private security advisory via GitHub's "Security" tab → "Report a vulnerability", or contact the maintainer directly through the email shown on the repo owner's profile.
+Instead, open a private security advisory via GitHub's "Security" tab → "Report a vulnerability".
 
 Please include:
 - A description of the issue and impact.

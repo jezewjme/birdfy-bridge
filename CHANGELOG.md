@@ -27,8 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The auth token cache file is created with `0600` permissions from the start
   (previously written, then chmodded — a brief default-umask window).
 - `Ctrl-C` now exits cleanly instead of dumping a `KeyboardInterrupt` traceback.
-- `test_api.py` used the websockets ≥14 `additional_headers` kwarg, which
-  doesn't exist in the pinned `<14` legacy client.
+- The integration smoke-test (`tests/test_api_integration.py`) used the
+  websockets ≥14 `additional_headers` kwarg, which doesn't exist in the pinned
+  `<14` legacy client; corrected to `extra_headers`.
 
 ## [0.1.0] — Initial public release
 
