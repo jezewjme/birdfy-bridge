@@ -38,7 +38,7 @@ RUN set -eux; \
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
         amd64) MTX_ARCH=linux_amd64 ;; \
-        arm64) MTX_ARCH=linux_arm64v8 ;; \
+        arm64) MTX_ARCH=linux_arm64 ;; \
         arm)   MTX_ARCH=linux_armv7 ;; \
         *) echo "unsupported arch: ${TARGETARCH}"; exit 1 ;; \
     esac; \
