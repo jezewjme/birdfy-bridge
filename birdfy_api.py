@@ -151,8 +151,14 @@ def _save_cached_auth(data: dict, email: str) -> None:
         # path passes "" and relies on the email already carried in `data`).
         to_store["_cached_email"] = email or data.get("_cached_email")
         to_store["_cached_at"] = int(time.time())
-        # Write then chmod (write_text won't set mode on existing files).
-        _AUTH_CACHE_FILE.write_text(json.dumps(to_store), encoding="utf-8")
+        # Create with 0600 from the start (an opener avoids the brief
+        # default-umask window a write-then-chmod would leave). chmod after
+        # covers a pre-existing file created with looser permissions.
+        def _opener(path, flags):
+            return os.open(path, flags, 0o600)
+
+        with open(_AUTH_CACHE_FILE, "w", encoding="utf-8", opener=_opener) as f:
+            f.write(json.dumps(to_store))
         try:
             os.chmod(_AUTH_CACHE_FILE, 0o600)
         except OSError:
