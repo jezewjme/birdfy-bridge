@@ -17,7 +17,7 @@ Auth flow (reverse-engineered from my.birdfy.com web app, confirmed working):
 Environment variables:
   BIRDFY_EMAIL         Netvue/Birdfy account email
   BIRDFY_PASSWORD      Netvue/Birdfy account password (plain text; MD5'd internally)
-  DEVICE_ID            Camera serial number (e.g. "5372540233101051"). Optional — defaults to first device on the account.
+  DEVICE_ID            Camera serial number (e.g. "1234567890123456"). Optional — defaults to first device on the account.
   RTSP_OUTPUT          Full RTSP push URL. If unset, built from RTSP_HOST + RTSP_PATH.
   RTSP_HOST            RTSP server host:port (default: localhost:8554) — used only if RTSP_OUTPUT is unset.
   RTSP_PATH            RTSP stream path (default: birdfy) — used only if RTSP_OUTPUT is unset.
