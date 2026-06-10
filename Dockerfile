@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ARG TARGETARCH
 ARG S6_OVERLAY_VERSION=3.2.0.2
