@@ -21,8 +21,10 @@ venv/
 .birdfy_auth_cache.json
 .birdfy_nvs_udid
 
-# Logs
+# Logs (including exported container-log copies saved as .txt)
 *.log
+_birdfy-bridge_logs*.txt
+frigate-logs.txt
 
 # Packet captures and HAR exports from protocol RE — never publish
 *.pcap
@@ -35,11 +37,13 @@ captures/
 HANDOFF.md
 prompt.md
 REVIEW_PROMPT.md
+FINAL_REVIEW_PROMPT.md
 REVIEW_REPORT.md
 patch_aioice.py
 
-# IDE / OS
+# IDE / OS / agent state
 .idea/
 .vscode/
+.claude/
 .DS_Store
 Thumbs.db

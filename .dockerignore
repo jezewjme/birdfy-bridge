@@ -21,6 +21,8 @@ venv/
 
 # Logs and captures
 *.log
+_birdfy-bridge_logs*.txt
+frigate-logs.txt
 *.pcap
 *.pcapng
 *.har
@@ -36,6 +38,7 @@ LICENSE
 HANDOFF.md
 prompt.md
 REVIEW_PROMPT.md
+FINAL_REVIEW_PROMPT.md
 REVIEW_REPORT.md
 patch_aioice.py
 tests/
