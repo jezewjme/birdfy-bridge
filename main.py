@@ -167,10 +167,26 @@ async def run_once():
         )
 
 
+# A session that ran at least this long actually connected and streamed; anything
+# shorter is a failed handshake or an offline/asleep camera. Failed handshakes can
+# take ~50s (the camera waits before sending PEER_OUT), so the bar is 60s.
+SESSION_OK_SECONDS = 60
+
+# Backoff schedule for consecutive failed/short sessions. The previous loop reset
+# to a fixed 2s on EVERY short session, so an offline camera was retried ~4x/min
+# indefinitely — one ~9h outage produced ~2000 getWebrtcTicket wake-pokes and never
+# escalated. Now each consecutive failure steps further along this ladder and holds
+# at the 5-min cap, so an offline camera is polled every few minutes until it
+# returns, then a successful stream resets us to the bottom. Each poke also nudges
+# the cloud to wake a battery cam, so backing off protects the battery too.
+BACKOFF_SCHEDULE = (2, 10, 30, 60, 120, 300)
+
+
 async def main():
-    retry_delay = 10
+    import time
+
+    consecutive_failures = 0
     while True:
-        import time
         t_start = time.monotonic()
         try:
             await run_once()
@@ -179,18 +195,27 @@ async def main():
             logger.error(f"Bridge error: {e}", exc_info=(log_level == "DEBUG"))
 
         elapsed = time.monotonic() - t_start
-        if elapsed < 60:
-            # Short session = camera rejected us (second PEER_IN / PEER_OUT) or
-            # signaling error. Failed handshakes can last up to ~50s (camera waits
-            # before sending PEER_OUT), so threshold is 60s not 30s. With the
-            # second-PEER_IN fix, failures now end in ~5s so 60s is generous.
-            logger.info("Short session — retrying in 2s ...")
-            await asyncio.sleep(2)
-            retry_delay = 10  # reset backoff
+        if elapsed >= SESSION_OK_SECONDS:
+            # Real session: the camera connected and streamed. Reset the ladder so
+            # the next blip retries quickly.
+            consecutive_failures = 0
+            delay = BACKOFF_SCHEDULE[0]
+            logger.info(f"Session lasted {elapsed:.0f}s — reconnecting in {delay}s ...")
         else:
-            logger.info(f"Waiting {retry_delay}s before retry ...")
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 120)
+            idx = min(consecutive_failures, len(BACKOFF_SCHEDULE) - 1)
+            delay = BACKOFF_SCHEDULE[idx]
+            consecutive_failures += 1
+            if delay >= BACKOFF_SCHEDULE[-1]:
+                logger.warning(
+                    f"Camera unreachable ({consecutive_failures} consecutive short "
+                    f"sessions) — backing off {delay}s (camera likely offline/asleep)."
+                )
+            else:
+                logger.info(
+                    f"Short session ({elapsed:.0f}s, failure #{consecutive_failures}) "
+                    f"— retrying in {delay}s ..."
+                )
+        await asyncio.sleep(delay)
 
 
 if __name__ == "__main__":
