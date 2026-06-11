@@ -454,6 +454,7 @@ async def forward_video(
         pump.start_writer()
         return p, pump
 
+    loop = asyncio.get_event_loop()
     proc: subprocess.Popen | None = None
     params = _ParamSetCache()
     pre_proc_frames_dropped = 0
@@ -611,7 +612,13 @@ async def forward_video(
                 out = data
 
             try:
-                proc.stdin.write(out)  # type: ignore[union-attr]
+                # Blocking write — offload to a thread so a momentarily-stalled
+                # ffmpeg (full stdin pipe) can't freeze the event loop. If the
+                # loop blocks here, the RTP receive loop, audio pump, and WS
+                # heartbeat all stall, the RTSP publish goes silent, and MediaMTX
+                # times out the publisher (the ~7-min reconnect/restart cascade
+                # seen after the aiortc/av bumps changed frame pacing).
+                await loop.run_in_executor(None, proc.stdin.write, out)  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("RTP forwarder: ffmpeg pipe broken — will restart on next keyframe")
                 _log_ffmpeg_tail()

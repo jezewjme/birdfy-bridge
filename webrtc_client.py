@@ -644,7 +644,10 @@ async def _stream_video(track, rtsp_output: str, state: dict, pc=None):
 
             try:
                 data = frame.to_ndarray(format="yuv420p")
-                proc.stdin.write(data.tobytes())  # type: ignore[union-attr]
+                # Offload the blocking stdin write so a stalled ffmpeg can't
+                # freeze the event loop (same fix as the RTP passthrough path).
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, proc.stdin.write, data.tobytes())  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("ffmpeg pipe broken — reconnecting")
                 break
