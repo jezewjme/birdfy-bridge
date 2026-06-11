@@ -37,6 +37,18 @@ Environment variables:
   BIRDFY_JITTER_CAPACITY / BIRDFY_RTP_HISTORY_SIZE / BIRDFY_NACK_INTERVAL_MS /
   BIRDFY_NACK_MAX_RETRIES   Keyframe-recovery tunables; see _aiortc_media_patches.py.
 
+  --- Optional: MQTT control + HA sensors (see mqtt_control.py) ---
+  MQTT_HOST            Broker host. UNSET = MQTT off; bridge runs exactly as before.
+  MQTT_PORT            Broker port (default: 1883).
+  MQTT_USERNAME        Broker username (optional; omit for anonymous).
+  MQTT_PASSWORD        Broker password (optional).
+  MQTT_BASE_TOPIC      Topic prefix for state/command (default: birdfy).
+  MQTT_DISCOVERY_PREFIX  HA MQTT-discovery prefix (default: homeassistant).
+  BIRDFY_MODE          First-boot mode before HA publishes one: always_on | auto |
+                       off (default: auto). HA's "Mode" select overrides at runtime.
+  BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online sensors this often
+                       (default: 0 = don't poll, leave camera alone).
+
   --- Optional overrides for NVS signing ---
   NVS_UCID             App client ID (default: 513774810c)
   NVS_UDID             Device UUID for signing (auto-generated and persisted if not set)
@@ -47,7 +59,15 @@ import os
 import sys
 from pathlib import Path
 
-from birdfy_api import get_addx_ticket, login_or_resume, select_single_device, stop_live
+from birdfy_api import (
+    DeviceOfflineError,
+    device_state_summary,
+    get_addx_ticket,
+    login_or_resume,
+    select_single_device,
+    stop_live,
+)
+from mqtt_control import MqttConfig, MqttControl
 from webrtc_client import connect_and_stream
 
 log_level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -101,7 +121,32 @@ RTSP_OUTPUT     = os.getenv("RTSP_OUTPUT") or (
 )
 
 
-async def run_once():
+def _pick_device(devices: list) -> dict | None:
+    """Select the target device: DEVICE_ID match if set, else first device.
+
+    Returns None only when the account has no devices. Logs a warning and falls
+    back to the first device when DEVICE_ID is set but not found.
+    """
+    if DEVICE_ID:
+        for device in devices:
+            if device.get("serialNumber") == DEVICE_ID or device.get("addxSn") == DEVICE_ID:
+                return device
+        available = [
+            f"{d.get('serialNumber')} / addxSn={d.get('addxSn')} ({d.get('deviceName')})"
+            for d in devices
+        ]
+        logger.warning(
+            f"Device {DEVICE_ID!r} not found — falling back to first device. "
+            f"Available: {available}"
+        )
+    if not devices:
+        return None
+    target = devices[0]
+    logger.info(f"Using device: {target.get('deviceName')!r} sn={target.get('serialNumber')}")
+    return target
+
+
+async def run_once(mqtt: MqttControl | None = None):
     # Step 1+2: Authenticate (reusing a cached token if still valid) and fetch
     # the device list. login_or_resume avoids a fresh /users/login/v2 — and the
     # "new device logged in" email it triggers — when a cached token still works,
@@ -111,29 +156,19 @@ async def run_once():
     user_id = str(auth_data.get("userID", ""))
     logger.info(f"Authenticated — userID={user_id} region={auth_data.get('region')}")
 
-    target = None
-    if DEVICE_ID:
-        for device in devices:
-            if device.get("serialNumber") == DEVICE_ID or device.get("addxSn") == DEVICE_ID:
-                target = device
-                break
-
+    target = _pick_device(devices)
     if target is None:
-        if DEVICE_ID:
-            available = [f"{d.get('serialNumber')} / addxSn={d.get('addxSn')} ({d.get('deviceName')})" for d in devices]
-            logger.warning(
-                f"Device {DEVICE_ID!r} not found — falling back to first device. "
-                f"Available: {available}"
-            )
-        if not devices:
-            raise RuntimeError("No devices found on this account.")
-        target = devices[0]
-        logger.info(f"Using device: {target.get('deviceName')!r} sn={target.get('serialNumber')}")
+        raise RuntimeError("No devices found on this account.")
 
     logger.info(
         f"Device found: {target.get('deviceName')!r} sn={target['serialNumber']} "
         f"addxSn={target.get('addxSn')} onAddx={target.get('onAddx')} region={target.get('region')}"
     )
+
+    # Now that the device is identified, bind MQTT to its serial/name and start
+    # the control task (idempotent — only the first call does anything).
+    if mqtt is not None:
+        mqtt.configure(str(target["serialNumber"]), target.get("deviceName") or "Birdfy")
 
     on_addx = target.get("onAddx", False)
 
@@ -149,7 +184,33 @@ async def run_once():
 
         logger.info(f"Device uses Addx WebRTC — fetching ticket (region={device_region}) ...")
         ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
-        await select_single_device(ticket)
+        state = await select_single_device(ticket)
+
+        # selectsingledevice carries live device state. Log battery on every
+        # attempt (so it's visible in the bridge log / status), publish it to
+        # MQTT for HA, and bail before the WebRTC handshake if the camera is
+        # offline — a sleeping/dead battery cam will never send PEER_IN, so
+        # attempting it just churns wake-pokes and burns ~13s per failed session.
+        # DeviceOfflineError routes to the backoff path in main() without
+        # counting as a connection failure.
+        summary = device_state_summary(state)
+        if mqtt is not None:
+            mqtt.publish_state(summary)
+        batt = summary["battery_level"]
+        charging = summary["is_charging"]
+        batt_str = f"{batt}%" if batt is not None else "unknown"
+        charge_str = (
+            " (charging)" if charging == 1 else "" if charging == 0 else ""
+        )
+        logger.info(
+            "Device state: online=%s awake=%s battery=%s%s",
+            summary["online"], summary["awake"], batt_str, charge_str,
+        )
+        # online is None when the field was missing/unparseable — only skip on a
+        # definite offline (online == 0), never on unknown, so a shape change in
+        # the API can't silently stop us from ever connecting.
+        if summary["online"] == 0:
+            raise DeviceOfflineError(summary)
 
         logger.info(f"Connecting to Addx WebRTC -> RTSP output: {RTSP_OUTPUT}")
         try:
@@ -195,15 +256,88 @@ SESSION_OK_SECONDS = 60
 BACKOFF_SCHEDULE = (2, 10, 30, 60, 120, 300)
 
 
+# In `off` mode, optionally refresh the device state (battery/online) this often
+# so the HA sensors don't go stale. 0 (default) = don't poll at all while off, so
+# `off` truly leaves the camera alone. selectsingledevice *may* be a passive
+# cloud read (state the camera last reported), in which case polling costs no
+# camera battery — set this (e.g. 1200) only once you've confirmed that on a
+# healthy battery. Until then the conservative default is no poll.
+OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "0") or "0")
+
+
+async def poll_state_only(mqtt: MqttControl) -> None:
+    """Fetch device state without opening a WebRTC session, publish to MQTT.
+
+    Used in `off` mode to keep HA's battery/online sensors fresh (when
+    BIRDFY_OFF_POLL_SECONDS > 0) without the wake-poke of a full handshake.
+    Best-effort: logs and returns on any error.
+    """
+    try:
+        auth_data, devices = await login_or_resume(BIRDFY_EMAIL, BIRDFY_PASSWORD)
+        target = _pick_device(devices)
+        if target is None or not target.get("onAddx"):
+            return
+        mqtt.configure(str(target["serialNumber"]), target.get("deviceName") or "Birdfy")
+        device_region = target.get("region") or auth_data.get("region")
+        ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
+        state = await select_single_device(ticket)
+        summary = device_state_summary(state)
+        mqtt.publish_state(summary)
+        batt = summary["battery_level"]
+        logger.info(
+            "[off] state poll: online=%s battery=%s",
+            summary["online"], f"{batt}%" if batt is not None else "unknown",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[off] state poll failed: %s", e)
+
+
 async def main():
     import time
 
+    mqtt = MqttControl(MqttConfig())
+    mqtt.start()  # no-op if MQTT disabled; binds serial later via configure()
+
     consecutive_failures = 0
+    # Each loop here is one camera session. The Birdfy's cloud WebRTC session
+    # drops every few minutes (camera sleep/wake), so re-publishing the RTSP
+    # output is normal, not an error. Downstream impact operators hit:
+    # every drop EOFs the detect substream, and go2rtc keeps a *derived*
+    # producer (e.g. `birdfy_sub`) alive only while a consumer is attached — so
+    # during the gap between EOF and Frigate's detect-ffmpeg restart, detect
+    # goes fully dark and Frigate's record maintainer stalls ("Too many
+    # unprocessed recording segments … keeping the N most recent"), silently
+    # dropping recordings. Fix is downstream config, not here:
+    #   - go2rtc >= 1.9.11: add a top-level `preload:` block for birdfy +
+    #     birdfy_sub so go2rtc maintains the streams regardless of consumers.
+    #   - go2rtc <= 1.9.10 (Frigate 0.15 bundles 1.9.10): lower the feeder
+    #     camera's ffmpeg `retry_interval` (default 10 -> 3) to shorten the gap.
     while True:
+        # `off` mode: don't connect at all (no WebRTC wake-pokes). Optionally
+        # refresh HA's battery/online sensors on a slow cadence, then wait.
+        if mqtt.get_mode() == "off":
+            if OFF_POLL_SECONDS > 0:
+                await poll_state_only(mqtt)
+            delay = OFF_POLL_SECONDS if OFF_POLL_SECONDS > 0 else BACKOFF_SCHEDULE[-1]
+            logger.info("Mode=off — bridge paused, re-checking mode in %ss ...", delay)
+            await asyncio.sleep(delay)
+            continue
+
         t_start = time.monotonic()
         try:
-            await run_once()
+            await run_once(mqtt)
             logger.warning("Session ended cleanly — reconnecting")
+        except DeviceOfflineError as e:
+            # Camera reported online=0 before we even tried the handshake.
+            # Expected for a sleeping/charging battery cam — not an error, no
+            # stack trace. Back off at the cap (no point polling every 2s) and
+            # leave the failure ladder alone; we never opened a WebRTC session.
+            delay = BACKOFF_SCHEDULE[-1]
+            logger.info(
+                "%s — skipping handshake, re-checking in %ss ...", e, delay
+            )
+            await asyncio.sleep(delay)
+            continue
         except Exception as e:
             logger.error(f"Bridge error: {e}", exc_info=(log_level == "DEBUG"))
 

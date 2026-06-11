@@ -78,6 +78,24 @@ RTP_HISTORY_SIZE = _env_int("BIRDFY_RTP_HISTORY_SIZE", 1024)
 NACK_INTERVAL_MS = _env_int("BIRDFY_NACK_INTERVAL_MS", 30)
 NACK_MAX_RETRIES = _env_int("BIRDFY_NACK_MAX_RETRIES", 12)
 
+# Stub out aiortc's video decoder. We forward H264 via the jitter-buffer tap
+# (_rtp_forwarder.py) with ffmpeg -c copy — the camera's bitstream is never
+# decoded by us. But aiortc's receiver decodes every completed frame anyway, on
+# a worker thread, purely to feed track.recv(); we only call recv() to drain
+# that thread's output queue. Since the av 16 bump, that decoder rejects this
+# camera's NALs (AVERROR_INVALIDDATA -> the noisy aiortc.codecs.h264 warnings).
+# Replacing the video decoder with a no-op keeps the worker thread draining its
+# input queue (its only structural job for us) while producing zero frames and
+# zero decode errors. Audio decode is left intact. Set BIRDFY_STUB_VIDEO_DECODE=0
+# to restore the real decoder (e.g. if a future device needs aiortc's decode
+# path or the _stream_video fallback).
+STUB_VIDEO_DECODE = os.getenv("BIRDFY_STUB_VIDEO_DECODE", "1") not in (
+    "0",
+    "false",
+    "False",
+    "",
+)
+
 # Validate capacity is a power of two (aiortc asserts this).
 if JITTER_CAPACITY & (JITTER_CAPACITY - 1) != 0:
     logger.warning(
@@ -283,16 +301,69 @@ def log_video_rtcp_feedback(pc) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Patch 4: no-op video decoder.
+#
+# rtcrtpreceiver.decoder_worker() resolves the module-global get_decoder at call
+# time, so rebinding _recv_mod.get_decoder swaps the decoder the worker thread
+# uses. We wrap it: for video codecs, hand back a stub whose decode() returns no
+# frames; for audio, defer to the real factory. The receiver's jitter buffer —
+# which our forwarder taps in _handle_rtp_packet, upstream of the decoder queue —
+# is unaffected. See STUB_VIDEO_DECODE above for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+class _NullVideoDecoder:
+    """Drop-in for aiortc's H264Decoder that decodes nothing.
+
+    decoder_worker() calls decode(encoded_frame) and iterates the result, so the
+    only contract we must honor is returning an (empty) iterable of frames.
+    """
+
+    def decode(self, encoded_frame):  # noqa: ANN001 - matches aiortc's signature
+        return []
+
+
+def _install_decoder_patch() -> None:
+    if not STUB_VIDEO_DECODE:
+        return
+    # Guard against double-patching (install() is idempotent / import-once, but
+    # be defensive): only wrap the original factory once.
+    if getattr(_recv_mod.get_decoder, "_birdfy_stubbed", False):
+        return
+
+    _orig_get_decoder = _recv_mod.get_decoder
+
+    def _patched_get_decoder(codec):  # noqa: ANN001
+        # codec.name is "H264"/"VP8"/... for video, "opus"/"PCMU"/... for audio.
+        # Match on the receiver kind via the codec's mimeType prefix instead of a
+        # codec allowlist so a resolution/profile change can't accidentally
+        # re-enable the real video decoder.
+        mime = getattr(codec, "mimeType", "") or ""
+        if mime.lower().startswith("video/"):
+            return _NullVideoDecoder()
+        return _orig_get_decoder(codec)
+
+    _patched_get_decoder._birdfy_stubbed = True  # type: ignore[attr-defined]
+    _recv_mod.get_decoder = _patched_get_decoder  # type: ignore[assignment]
+    logger.info(
+        "Video decoder stubbed (no-op) — forwarder uses jitter-buffer tap; "
+        "set BIRDFY_STUB_VIDEO_DECODE=0 to restore aiortc decode"
+    )
+
+
 def install() -> None:
     """Install the buffer/NACK-window patches. Idempotent."""
     _install_buffer_patches()
+    _install_decoder_patch()
     logger.info(
         "aiortc media patches installed: jitter_capacity=%d rtp_history=%d "
-        "renack_interval_ms=%d renack_max_retries=%d",
+        "renack_interval_ms=%d renack_max_retries=%d stub_video_decode=%s",
         JITTER_CAPACITY,
         RTP_HISTORY_SIZE,
         NACK_INTERVAL_MS,
         NACK_MAX_RETRIES,
+        STUB_VIDEO_DECODE,
     )
 
 

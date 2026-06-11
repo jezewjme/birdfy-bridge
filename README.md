@@ -112,6 +112,14 @@ This keeps a **single** connection to the bridge (go2rtc derives the substream i
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
 | `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |
 | `BIRDFY_NACK_MAX_RETRIES`  | No | Max re-NACK re-sends per missing packet (default: `12`). |
+| `BIRDFY_STUB_VIDEO_DECODE` | No | `0` to restore aiortc's real H264 decoder. Default on (no-op decoder) — we forward via `-c copy` and never use decoded frames, so this silences the decoder's `Invalid data` warnings on this camera's bitstream. |
+| `MQTT_HOST`                | No | MQTT broker host. **Unset = MQTT disabled**; the bridge runs exactly as before. See [Home Assistant control & sensors](#home-assistant-control--sensors). |
+| `MQTT_PORT`                | No | Broker port (default: `1883`). |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Broker credentials. Omit both for an anonymous broker. |
+| `MQTT_BASE_TOPIC`          | No | Topic prefix for state/command topics (default: `birdfy`). |
+| `MQTT_DISCOVERY_PREFIX`    | No | Home Assistant MQTT-discovery prefix (default: `homeassistant`). |
+| `BIRDFY_MODE`              | No | First-boot mode before HA publishes one: `always_on` / `auto` / `off` (default: `auto`). The HA **Mode** select overrides this at runtime. |
+| `BIRDFY_OFF_POLL_SECONDS`  | No | In `off` mode, refresh the battery/online sensors this often (default: `0` = don't poll; leave the camera alone). |
 
 ## Token persistence
 
@@ -122,6 +130,32 @@ How it works: after a successful login the token (plus region/endpoint) is writt
 For this to survive container recreation, `BIRDFY_STATE_DIR` must point at a persistent path. The bundled `compose.yaml` sets `BIRDFY_STATE_DIR=/data` backed by a named `birdfy-state` volume, so it works out of the box. If you run the image without that compose file, add an equivalent volume (e.g. `-v birdfy-state:/data -e BIRDFY_STATE_DIR=/data`), or the token (and UDID) will be lost on every recreate and the emails return.
 
 Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
+
+## Home Assistant control & sensors
+
+Optional. Set `MQTT_HOST` (and credentials if your broker needs them) and the bridge connects to MQTT, **auto-creates** a device in Home Assistant via MQTT Discovery, and exposes:
+
+- **Mode** (`select`): `always_on` / `auto` / `off` — controls the bridge live.
+- **Battery** (`sensor`, `%`): the camera's last-reported charge. Alert on this in HA and a dying battery never blindsides you again.
+- **Online / Awake / Charging** (`binary_sensor`).
+
+If `MQTT_HOST` is unset, none of this runs and the bridge behaves exactly as before. MQTT outages never affect streaming — the bridge keeps running in whatever mode it last had (or `BIRDFY_MODE`).
+
+### The three modes
+
+| Mode | Behavior | Use for |
+|------|----------|---------|
+| `always_on` | Connect whenever the camera is online. | Max coverage. |
+| `auto` | Connect, but defer to the camera's **native dormancy schedule** (set in the Birdfy app). During the overnight window the camera reports offline and the bridge backs off — no wake-pokes. | Saving battery overnight while keeping daytime coverage. |
+| `off` | Pause the connect loop entirely; the camera is left alone. | Hard stop. |
+
+**Why `auto` saves the most battery:** the bridge is only a *viewer* — it can't stop the camera's own wake/detect cycles. Setting the camera's **native overnight dormancy in the Birdfy app** is what actually conserves power; `auto` simply respects the resulting offline window instead of churning reconnect attempts against a sleeping cam. The mode is read from a *retained* MQTT topic, so it survives bridge restarts.
+
+> **Battery polling in `off` mode:** reading battery requires a `selectsingledevice` call. This *may* be a passive cloud read (the state the camera last reported) that costs no camera battery — but that isn't confirmed, so `off` mode does **not** poll by default (`BIRDFY_OFF_POLL_SECONDS=0`) and the HA battery sensor simply holds its last value. If you confirm the read is passive on a healthy battery, set `BIRDFY_OFF_POLL_SECONDS=1200` for a live overnight battery sensor.
+
+### Connecting to Home Assistant's Mosquitto
+
+Point `MQTT_HOST` at the broker reachable from the bridge container (typically the HA host's LAN IP, or a shared Docker network's broker service name), set `MQTT_PORT` (1883) and `MQTT_USERNAME`/`MQTT_PASSWORD` for a dedicated MQTT user. With HA's MQTT integration enabled, the **Birdfy** device and its entities appear automatically — no YAML.
 
 ## Security warnings
 
@@ -138,6 +172,7 @@ Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 - **Token refresh is best-effort**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
 - **Audio is POSIX-only**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
 - **Healthcheck grace window**: The container healthcheck verifies the `birdfy` path is actively publishing, with a grace window to tolerate normal reconnects — a dead stream takes up to ~5 minutes to surface as unhealthy (see [Container healthcheck](#container-healthcheck)).
+- **Offline / sleeping cameras**: Battery cameras sleep and report `online: 0` between events (and a dead battery takes them fully offline). Before each connection the bridge reads the device's live state and, if it's offline, logs `Device state: online=0 … battery=N%` and **skips the WebRTC handshake**, backing off instead of churning futile reconnects (which would only burn battery waking the cloud). This is expected — the bridge resumes automatically when the camera returns. If MQTT is configured, battery/online are also exposed as HA sensors so you can alert before it dies.
 
 ## How it works
 
@@ -174,8 +209,12 @@ The Birdfy / Netvue cloud API uses a custom auth scheme reverse-engineered from 
    re-encodes anyway. Instead we tap aiortc's jitter buffer between depayload and
    decode, pull the reassembled Annex B frames, and pipe them to an
    `ffmpeg -c copy -f rtsp` passthrough (see [`_rtp_forwarder.py`](_rtp_forwarder.py)).
-   No decode, no re-encode. See [RTP receive-path quirks](#rtp-receive-path-quirks)
-   for the keyframe-recovery and timestamp fixes that make this reliable.
+   No decode, no re-encode. Because we never use the decoder's output, aiortc's
+   video decoder is replaced with a no-op (see `BIRDFY_STUB_VIDEO_DECODE`) — this
+   stops the noisy `H264Decoder() failed to decode` warnings the libavcodec
+   decoder emits on this bitstream, which got louder after the `av` bump. See
+   [RTP receive-path quirks](#rtp-receive-path-quirks) for the keyframe-recovery
+   and timestamp fixes that make this reliable.
 
 ### KVS WebRTC path (`onAddx: false` — not yet implemented)
 
@@ -256,8 +295,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
 ### Python (`requirements.txt`)
 - `aiortc` — WebRTC library (handles SDP, ICE, H264 depayload). Patched at runtime; see [RTP receive-path quirks](#rtp-receive-path-quirks).
 - `aiohttp` — async HTTP for API calls
-- `websockets` — WebSocket client for signaling
-- `av`, `numpy` — pulled in by aiortc (we don't decode video ourselves)
+- `websockets` — WebSocket client for signaling. Works on both the legacy (`<14`) and modern asyncio (`>=14`) APIs — the `extra_headers`→`additional_headers` rename is handled at runtime, so the version is unpinned across that boundary.
+- `aiomqtt` — optional; only used when `MQTT_HOST` is set (see [Home Assistant control & sensors](#home-assistant-control--sensors)).
+- `av`, `numpy` — pulled in by aiortc (we don't decode video ourselves; the decoder is stubbed to a no-op)
 
 ### System (Docker image installs these)
 - `ffmpeg` — H264 passthrough (`-c copy`) + push RTSP (no re-encode)
