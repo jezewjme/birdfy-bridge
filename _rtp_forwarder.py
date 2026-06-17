@@ -47,21 +47,33 @@ logger = logging.getLogger(__name__)
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
 _START_CODE = b"\x00\x00\x00\x01"
 
-# The camera's negotiated frame rate (confirmed in ffmpeg's input probe: "15 fps").
-# We stamp the copied stream at this exact rate (-bsf:v setts below), so output
+# The frame rate we stamp the copied stream at (-bsf:v setts below), so output
 # timestamps are clean and Frigate's fps-cap watchdog doesn't tear the stream down.
 #
-# IMPORTANT: this MUST match the camera's real *encode* rate. It is NOT a throttle.
-# Because we -c copy (no re-encode), ffmpeg can't actually resample to this value;
-# it only assigns timestamps as if each frame is 1/FRAME_RATE apart. Set it lower
-# than the true rate and you don't drop frames — you mislabel timing, so playback
-# runs in slow motion and a/v drifts. (We learned this the hard way: BIRDFY_FRAME_
-# RATE=5 was tried as a "fix" for stream jitter; the real cause was unset PTS, see
-# the setts note in _start_ffmpeg. The 5 just distorted timing — leave this at 15.)
+# IMPORTANT: this MUST match the camera's real *delivered* rate. It is NOT a
+# throttle. Because we -c copy (no re-encode), ffmpeg can't resample to this
+# value; it only assigns timestamps as if each frame is 1/FRAME_RATE apart. Set
+# it wrong and you don't drop frames — you mislabel timing:
+#   too low  → output runs in slow motion and a/v drifts;
+#   too high → the output's media clock runs faster than wall-clock, so Frigate's
+#              fps-cap watchdog trips and tears the stream down (the go2rtc
+#              "error=EOF" / reconnect churn, and "exceeded fps limit" kills).
+#
+# The camera's SDP *advertises* 15 fps, but its adaptive encoder (the autoBitrate
+# control seen on the data channel) actually delivers ~9 fps sustained — measured
+# from the forwarder's own frame-count logs across multiple sessions (e.g. 2500
+# frames over ~287s ≈ 8.7 fps). A hard-coded 15 was therefore ~1.7x too fast and
+# was the real cause of the Frigate fps-cap teardowns. 9 matches the observed
+# delivery; the residual second-to-second wobble (~8-11 fps) is absorbed by the
+# jitter buffer + RTSP and does not trip the cap.
+#
+# If a future device/firmware delivers a different sustained rate, set
+# BIRDFY_FRAME_RATE to match it (confirm against the "N frames / M bytes
+# forwarded" log lines: fps ≈ Δframes / Δseconds).
 #
 # To reduce Frigate's *detection* CPU, set `detect: fps:` in the Frigate camera
 # config instead — that's a separate downstream knob and doesn't belong here.
-FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "15"))
+FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "9") or "9")
 
 # Depth of the depayload->ffmpeg hand-off queue, in frames. The camera link is
 # lossy (see the re-NACK heartbeat in _aiortc_media_patches.py): aiortc's jitter
@@ -72,7 +84,7 @@ FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "15"))
 # in Frigate). NOTE: sustained (not bursty) overflow means ffmpeg itself is
 # stalled, not that this is too small — that was the unset-PTS muxer stall, fixed
 # by the setts filter (see _start_ffmpeg); don't paper over a recurrence by just
-# raising this. At 15 fps, 512 frames ≈ 34s of slack. Override via env if needed.
+# raising this. At ~9 fps, 512 frames ≈ 57s of slack. Override via env if needed.
 QUEUE_MAXSIZE = int(os.getenv("BIRDFY_FORWARD_QUEUE", "512") or "512")
 
 # Where ffmpeg's stderr is written. We tail this into the main log on exit so
@@ -233,12 +245,14 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         "Timestamps are unset in a packet", and the muxer stalled to speed≈0.2x —
         backpressuring stdin so our hand-off queue overflowed (multi-second skips).
     Fix: assign timestamps directly on the copied stream with the setts bitstream
-    filter, in RTP's native 90 kHz timebase (-bsf:v setts=pts=N*6000:dts=N*6000:
-    time_base=1/90000, where 6000 = 90000/FRAME_RATE). Frame N is stamped at
+    filter, in RTP's native 90 kHz timebase (-bsf:v setts=pts=N*K:dts=N*K:
+    time_base=1/90000, where K = 90000/FRAME_RATE). Frame N is stamped at
     N/FRAME_RATE seconds — perfectly monotonic CFR, independent of arrival order,
     no decode. Verified in-container that this clears the "Timestamps are unset"
-    muxer stall that +genpts alone does not. The camera's negotiated stream is
-    15 fps (confirmed in input probe) and has no B-frames, so PTS==DTS is correct.
+    muxer stall that +genpts alone does not. FRAME_RATE must match the camera's
+    real *delivered* rate (~9 fps measured; the 15 fps the SDP advertises is the
+    encoder ceiling, not what autoBitrate actually sends) — see the FRAME_RATE
+    note above. The stream has no B-frames (only SLICE/IDR NALs) so PTS==DTS.
 
     -c copy: no re-encode (the whole point of this path).
 
@@ -299,12 +313,13 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         #
         # The setts bitstream filter assigns timing directly, no decode:
         #   time_base=1/90000  → RTSP/RTP's native 90 kHz clock
-        #   pts=dts=N*6000     → frame N at N*(90000/FRAME_RATE) ticks = N/FRAME_RATE s
-        # 6000 = 90000/15. Independent of arrival order / NACK-recovery jitter, so
-        # DTS is always monotonic (no "Non-monotonous DTS" → no Frigate fps-cap
-        # teardown) and the stream is real-time-paced regardless of bursty
-        # delivery. The camera has no B-frames (only SLICE/IDR NALs) so PTS==DTS.
-        # NOTE: 6000 hard-codes FRAME_RATE=15; recomputed below if overridden.
+        #   pts=dts=N*K        → frame N at N*(90000/FRAME_RATE) ticks = N/FRAME_RATE s
+        # K = 90000/FRAME_RATE (e.g. 10000 at 9 fps). Independent of arrival order
+        # / NACK-recovery jitter, so DTS is always monotonic (no "Non-monotonous
+        # DTS" → no Frigate fps-cap teardown) and the stream is real-time-paced
+        # regardless of bursty delivery. The camera has no B-frames (only SLICE/IDR
+        # NALs) so PTS==DTS. FRAME_RATE must track the real delivered rate (see the
+        # FRAME_RATE note above); a too-high value here makes the clock run fast.
         "-bsf:v",
         f"setts=pts=N*{90000 // FRAME_RATE}:dts=N*{90000 // FRAME_RATE}:time_base=1/90000",
     ]

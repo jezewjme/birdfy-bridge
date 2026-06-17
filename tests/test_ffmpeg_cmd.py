@@ -4,7 +4,7 @@ The big timestamp fix in this PR: drop -fflags +genpts / -fps_mode cfr (which
 can't stamp a -c copy'd raw Annex B stream) in favor of a `setts` bitstream
 filter that assigns CFR PTS/DTS in RTP's 90 kHz timebase. The N*tick value is
 90000 // FRAME_RATE, so it MUST track BIRDFY_FRAME_RATE — a stale hard-coded
-6000 against a non-15 rate would mislabel timing and play back in slow motion.
+tick against a different rate would mislabel timing and play back in slow motion.
 
 We capture the argv handed to subprocess.Popen instead of spawning ffmpeg.
 """
@@ -50,10 +50,14 @@ def test_uses_setts_not_genpts_or_fps_mode(capture_popen):
 
 
 def test_setts_uses_90khz_timebase_and_default_rate(capture_popen):
-    # Default FRAME_RATE is 15 -> 90000 // 15 == 6000.
+    # Default FRAME_RATE is 9 (the camera's measured delivered rate) -> the tick
+    # is 90000 // 9 == 10000. Derive it from the module so this tracks the default
+    # rather than re-hard-coding a number that drifts from the source.
+    tick = 90000 // _rtp_forwarder.FRAME_RATE
     _rtp_forwarder._start_ffmpeg("rtsp://localhost:8554/birdfy")
     arg = _setts_arg(capture_popen.last_cmd)
-    assert arg == "setts=pts=N*6000:dts=N*6000:time_base=1/90000"
+    assert _rtp_forwarder.FRAME_RATE == 9
+    assert arg == f"setts=pts=N*{tick}:dts=N*{tick}:time_base=1/90000"
 
 
 def test_setts_tick_tracks_frame_rate_override(monkeypatch, capture_popen):
