@@ -19,7 +19,7 @@ All configuration is via environment variables (set them in `.env` for the bundl
 | `NVS_NO_TOKEN_CACHE`       | No | Set to disable token caching and always do a fresh login. |
 | `NVS_NO_TOKEN_REFRESH`     | No | Set to disable the `refreshToken`-based renewal on token expiry (falls straight back to a full login). |
 | `BIRDFY_AUDIO`             | No | `0` to disable PCMU audio passthrough (video-only). Default on. POSIX-only; auto-disables elsewhere. |
-| `BIRDFY_FRAME_RATE`        | No | Seed for ffmpeg's raw-H264 demuxer fps guess (`-r`, default: `9`). No longer the A/V-sync-critical value it once was — output timing now comes from input wallclock timestamps on paced writes, not a fixed CFR. See [Stream timestamps](protocol.md#stream-timestamps-broken-timing--frigate-fps-cap-kill--av-drift). |
+| `BIRDFY_FRAME_RATE`        | No | Constant frame rate the copied stream is stamped at via `setts` (default: `9`, the camera's ~real delivered rate). Must match the real delivered rate: too high trips Frigate's fps-cap, and any mismatch drifts video against the audio sample clock. See [Stream timestamps](protocol.md#stream-timestamps-broken-timing--frigate-fps-cap-kill--av-drift). |
 | `BIRDFY_JITTER_CAPACITY`   | No | aiortc video jitter buffer size, power of 2 (default: `2048`). Widened to fit large keyframes. |
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
 | `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |

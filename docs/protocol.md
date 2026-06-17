@@ -19,7 +19,7 @@ flowchart LR
         gate["Wait for SPS+PPS+IDR<br/>skip headerless frames"]
         prepend["Prepend cached<br/>SPS/PPS to each IDR"]
     end
-    ff["ffmpeg -c copy<br/>input wallclock timestamps<br/>(paced writes; + PCMU audio -c:a copy)"]
+    ff["ffmpeg -c copy<br/>setts CFR timestamps (origin 0)<br/>(+ PCMU audio -c:a copy)"]
     mtx["MediaMTX<br/>RTSP :8554/birdfy"]
     client["Frigate / go2rtc /<br/>VLC / Home Assistant"]
 
@@ -141,11 +141,13 @@ The camera's keyframes are large (~25–52 KB ≈ 50–110 RTP packets of FU-A f
 
 ### Stream timestamps (broken timing → Frigate fps-cap kill / A/V drift)
 
-The raw Annex B stream we feed ffmpeg under `-c copy` carries no container timing, so the passthrough must synthesize it. Two approaches were tried and abandoned:
+The raw Annex B stream we feed ffmpeg under `-c copy` carries no container timing, so the passthrough must synthesize it. Approaches tried and rejected:
 
 - **Arrival wall-clock on raw packets.** NACK-recovered/reordered frames arrive out of order, so DTS went backwards (`Non-monotonous DTS`) and the stream looked like ~30 fps to Frigate — its fps-cap watchdog killed the reader, tearing down the RTSP session, breaking ffmpeg's pipe, dropping the MediaMTX path, and cascading into `404 Not Found` on Frigate's restart.
-- **Fixed-CFR `setts`** (`setts=pts=N*K:dts=N*K:time_base=1/90000`, `K = 90000/BIRDFY_FRAME_RATE`). Strictly monotonic and it cleared the muxer stall, but it labels every frame exactly `1/FRAME_RATE` apart — a *different clock* from the audio, which ffmpeg paces off its true 8 kHz µ-law sample count (≈ real wall-clock). The camera's real delivered rate wobbles (~8.6 fps measured, autoBitrate-driven) and never equals `FRAME_RATE`, so the video media clock ran ~4.5% fast against audio and **A/V drifted apart by minutes** over a long session.
+- **`-use_wallclock_as_timestamps` to share the audio clock.** Tempting (it would put video on the same real clock the audio sample count rides, killing A/V drift), but it stamps video PTS at *absolute epoch* (~1.7 billion seconds in 90 kHz units) while audio starts at ~0. The billion-second origin gap between the two tracks made downstream readers find no usable video stream (`Output file does not contain any stream` / `no video stream`) and crash-loop. The video PTS origin **must** be ~0 to match audio.
 
-Current approach (`_rtp_forwarder.py`): drive **both** streams off the same real wall-clock. ffmpeg uses `-use_wallclock_as_timestamps 1` on the video input, stamping each frame at the instant it *reads* it from the pipe; `forward_video` paces each stdin write to the frame's own monotonic jitter-buffer completion time (the `pace_anchor` logic). Because we write fully assembled frames in decode order (the jitter buffer already reorders), and pace them to true completion times, ffmpeg's read-time is monotonic **and** spaced at the real delivery cadence — no DTS inversion, no muxer stall, and on the **same** clock as the audio sample count, so A/V can't drift. `BIRDFY_FRAME_RATE` no longer affects A/V sync; it only seeds the demuxer's initial fps guess (`-r`).
+Current approach (`_rtp_forwarder.py`): assign constant-rate, strictly-monotonic timestamps **starting at PTS 0** on the copied stream with ffmpeg's `setts` bitstream filter, in RTP's native 90 kHz timebase (`setts=pts=N*K:dts=N*K:time_base=1/90000`, `K = 90000/BIRDFY_FRAME_RATE`). Frame N is stamped at `N/BIRDFY_FRAME_RATE` seconds — monotonic, no decode, origin-0 so audio and video start aligned. Neither `-fps_mode cfr` nor `-fflags +genpts` works here (under `-c copy` they dup/drop against *input* timestamps, but raw Annex B has none → unset PTS → muxer stall at speed ≈ 0.2×).
+
+**A/V drift caveat:** `setts` labels every frame exactly `1/FRAME_RATE` apart, while the audio rides its true 8 kHz µ-law sample clock. If `BIRDFY_FRAME_RATE` differs from the camera's real delivered rate (~8.6 fps measured, autoBitrate-driven — the SDP's 15 fps is the encoder ceiling), the video media clock runs fast/slow against audio and the two drift apart over a long session (a fixed `9` against a measured `8.6` ran ~4.5% fast — minutes of skew over an hour). So `BIRDFY_FRAME_RATE` **does** affect A/V sync; keep it on the real delivered rate. The residual second-to-second wobble is small and bounded.
 
 > Downstream, point Frigate at the bridge per [Pointing Frigate at the bridge](frigate.md): hardware-decode the full-res stream rather than re-encoding a go2rtc detect substream, which avoids reintroducing the same fps-cap teardown on the substream hop.

@@ -33,9 +33,9 @@ Environment variables:
 
   --- Optional: media (see _rtp_forwarder.py / _aiortc_media_patches.py) ---
   BIRDFY_AUDIO         0 to disable PCMU audio passthrough (default: on; POSIX-only).
-  BIRDFY_FRAME_RATE    Seed for ffmpeg's raw-H264 demuxer fps guess (default: 9).
-                       No longer A/V-sync-critical: output timing comes from input
-                       wallclock timestamps on paced writes (see _rtp_forwarder.py).
+  BIRDFY_FRAME_RATE    Constant output frame rate the copied stream is stamped at
+                       (default: 9). Must match the camera's real delivered rate:
+                       a mismatch drifts video against audio (see _rtp_forwarder.py).
   BIRDFY_JITTER_CAPACITY / BIRDFY_RTP_HISTORY_SIZE / BIRDFY_NACK_INTERVAL_MS /
   BIRDFY_NACK_MAX_RETRIES   Keyframe-recovery tunables; see _aiortc_media_patches.py.
 
