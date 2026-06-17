@@ -19,7 +19,7 @@ All configuration is via environment variables (set them in `.env` for the bundl
 | `NVS_NO_TOKEN_CACHE`       | No | Set to disable token caching and always do a fresh login. |
 | `NVS_NO_TOKEN_REFRESH`     | No | Set to disable the `refreshToken`-based renewal on token expiry (falls straight back to a full login). |
 | `BIRDFY_AUDIO`             | No | `0` to disable PCMU audio passthrough (video-only). Default on. POSIX-only; auto-disables elsewhere. |
-| `BIRDFY_FRAME_RATE`        | No | Constant output frame rate fed to ffmpeg (default: `15`, the camera's negotiated rate). See [RTP receive-path quirks](protocol.md#rtp-receive-path-quirks). |
+| `BIRDFY_FRAME_RATE`        | No | Seed for ffmpeg's raw-H264 demuxer fps guess (`-r`, default: `9`). No longer the A/V-sync-critical value it once was — output timing now comes from input wallclock timestamps on paced writes, not a fixed CFR. See [Stream timestamps](protocol.md#stream-timestamps-broken-timing--frigate-fps-cap-kill--av-drift). |
 | `BIRDFY_JITTER_CAPACITY`   | No | aiortc video jitter buffer size, power of 2 (default: `2048`). Widened to fit large keyframes. |
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
 | `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |
@@ -32,6 +32,7 @@ All configuration is via environment variables (set them in `.env` for the bundl
 | `MQTT_DISCOVERY_PREFIX`    | No | Home Assistant MQTT-discovery prefix (default: `homeassistant`). |
 | `BIRDFY_MODE`              | No | First-boot mode before HA publishes one: `always_on` / `auto` / `off` (default: `auto`). The HA **Mode** select overrides this at runtime. |
 | `BIRDFY_OFF_POLL_SECONDS`  | No | In `off` mode, refresh the battery/online sensors this often (default: `0` = don't poll; leave the camera alone). |
+| `BIRDFY_OFF_SENTINEL`      | No | Path to the off-mode sentinel file the bridge touches while in `off` mode (default: `/tmp/birdfy_mode_off`). The container healthcheck treats its presence as HEALTHY so it doesn't restart an intentionally-paused bridge. Must match the healthcheck's value. See [Operations](operations.md). |
 
 ## Finding your DEVICE_ID
 

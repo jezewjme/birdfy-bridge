@@ -33,7 +33,9 @@ Environment variables:
 
   --- Optional: media (see _rtp_forwarder.py / _aiortc_media_patches.py) ---
   BIRDFY_AUDIO         0 to disable PCMU audio passthrough (default: on; POSIX-only).
-  BIRDFY_FRAME_RATE    Constant output frame rate fed to ffmpeg (default: 15).
+  BIRDFY_FRAME_RATE    Seed for ffmpeg's raw-H264 demuxer fps guess (default: 9).
+                       No longer A/V-sync-critical: output timing comes from input
+                       wallclock timestamps on paced writes (see _rtp_forwarder.py).
   BIRDFY_JITTER_CAPACITY / BIRDFY_RTP_HISTORY_SIZE / BIRDFY_NACK_INTERVAL_MS /
   BIRDFY_NACK_MAX_RETRIES   Keyframe-recovery tunables; see _aiortc_media_patches.py.
 
@@ -48,6 +50,9 @@ Environment variables:
                        off (default: auto). HA's "Mode" select overrides at runtime.
   BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online sensors this often
                        (default: 0 = don't poll, leave camera alone).
+  BIRDFY_OFF_SENTINEL  Path to the off-mode sentinel the healthcheck honors as
+                       HEALTHY (default: /tmp/birdfy_mode_off). Must match
+                       docker/healthcheck.py.
   BIRDFY_SESSION_STATE_POLL_SECONDS  While a stream is live, re-read battery/online
                        state this often so HA sensors don't go stale on long
                        sessions (default: 60; 0 = only publish at session start).
@@ -316,6 +321,31 @@ SESSION_STATE_POLL_SECONDS = int(
 )
 
 
+# Sentinel the container healthcheck watches to know the bridge is intentionally
+# in `off` mode. In off mode the bridge never publishes to MediaMTX, so the
+# healthcheck's publish check would otherwise flap UNHEALTHY after its grace
+# window and make Docker restart a perfectly healthy container. We touch this file
+# while off and remove it as soon as we leave off, so "not publishing" is
+# distinguishable from "broken". Must match _OFF_SENTINEL in docker/healthcheck.py.
+OFF_SENTINEL = os.getenv("BIRDFY_OFF_SENTINEL", "/tmp/birdfy_mode_off")
+
+
+def _set_off_sentinel(active: bool) -> None:
+    """Create/remove the off-mode healthcheck sentinel. Best-effort: a failure to
+    touch it would only risk a spurious restart, never crash the bridge."""
+    try:
+        if active:
+            with open(OFF_SENTINEL, "w") as f:
+                f.write("off\n")
+        else:
+            try:
+                os.unlink(OFF_SENTINEL)
+            except FileNotFoundError:
+                pass
+    except OSError as e:  # noqa: BLE001
+        logger.warning("Could not update off sentinel %s: %s", OFF_SENTINEL, e)
+
+
 async def _publish_state_from_ticket(mqtt: MqttControl, ticket: dict) -> None:
     """Re-read device state with an existing ticket and publish to MQTT.
 
@@ -407,14 +437,20 @@ async def main():
     #     camera's ffmpeg `retry_interval` (default 10 -> 3) to shorten the gap.
     while True:
         # `off` mode: don't connect at all (no WebRTC wake-pokes). Optionally
-        # refresh HA's battery/online sensors on a slow cadence, then wait.
+        # refresh HA's battery/online sensors on a slow cadence, then wait. Touch
+        # the off sentinel so the healthcheck knows "not publishing" is intentional
+        # and doesn't restart us (see _set_off_sentinel).
         if mqtt.get_mode() == "off":
+            _set_off_sentinel(True)
             if OFF_POLL_SECONDS > 0:
                 await poll_state_only(mqtt)
             delay = OFF_POLL_SECONDS if OFF_POLL_SECONDS > 0 else BACKOFF_SCHEDULE[-1]
             logger.info("Mode=off — bridge paused, re-checking mode in %ss ...", delay)
             await asyncio.sleep(delay)
             continue
+        # Not off (or just left off): clear the sentinel so a genuinely stuck
+        # stream can still go unhealthy.
+        _set_off_sentinel(False)
 
         t_start = time.monotonic()
         try:

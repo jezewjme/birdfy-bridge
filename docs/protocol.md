@@ -19,7 +19,7 @@ flowchart LR
         gate["Wait for SPS+PPS+IDR<br/>skip headerless frames"]
         prepend["Prepend cached<br/>SPS/PPS to each IDR"]
     end
-    ff["ffmpeg -c copy<br/>setts CFR timestamps<br/>(+ PCMU audio -c:a copy)"]
+    ff["ffmpeg -c copy<br/>input wallclock timestamps<br/>(paced writes; + PCMU audio -c:a copy)"]
     mtx["MediaMTX<br/>RTSP :8554/birdfy"]
     client["Frigate / go2rtc /<br/>VLC / Home Assistant"]
 
@@ -139,10 +139,13 @@ The camera's keyframes are large (~25–52 KB ≈ 50–110 RTP packets of FU-A f
 
 `_aiortc_media_patches.py` fixes this by (1) widening the video jitter buffer (128 → 2048), (2) widening the NACK tracking window (128 → 1024), and (3) adding a **periodic re-NACK** loop per video receiver that re-requests still-missing sequence numbers until they arrive — which is what actually recovers a dropped keyframe-head fragment. All four parameters are env-tunable (see [Configuration](configuration.md)). It also logs the camera's advertised RTCP feedback (whether `nack` is supported), every re-NACK, and a per-session corruption tally for debugging.
 
-### Stream drops (broken timestamps → Frigate fps-cap kill → 404 cascade)
+### Stream timestamps (broken timing → Frigate fps-cap kill / A/V drift)
 
-The passthrough ffmpeg originally stamped frames at arrival wall-clock time. But NACK-recovered and reordered frames arrive out of order, so wall-clock DTS went backwards (`Non-monotonous DTS` in ffmpeg logs) and the stream looked like ~30 fps to Frigate. Frigate's fps-cap watchdog then killed its reader, which tore down the RTSP session, broke our ffmpeg's pipe, and dropped the MediaMTX path — after which Frigate's restart hit `404 Not Found` in a restart cascade.
+The raw Annex B stream we feed ffmpeg under `-c copy` carries no container timing, so the passthrough must synthesize it. Two approaches were tried and abandoned:
 
-Fixed in `_rtp_forwarder.py` by assigning constant-rate, strictly-monotonic timestamps directly on the copied stream with ffmpeg's `setts` bitstream filter, in RTP's native 90 kHz timebase (`setts=pts=N*6000:dts=N*6000:time_base=1/90000`, where `6000 = 90000/BIRDFY_FRAME_RATE`). Frame N is stamped at `N/BIRDFY_FRAME_RATE` seconds — perfectly monotonic CFR, independent of arrival order, no decode. Neither `-fps_mode cfr` nor `-fflags +genpts` works here: under `-c copy` they dup/drop against *input* timestamps, but raw Annex B has none, so packets reached the RTSP muxer with unset PTS and the muxer stalled (`Timestamps are unset in a packet`, speed ≈ 0.2×) — backpressuring our hand-off queue into multi-second skips. The `setts` filter is what actually clears that. `BIRDFY_FRAME_RATE` (default 15, the camera's negotiated rate) must match the camera's real encode rate — it assigns timing, it does not throttle.
+- **Arrival wall-clock on raw packets.** NACK-recovered/reordered frames arrive out of order, so DTS went backwards (`Non-monotonous DTS`) and the stream looked like ~30 fps to Frigate — its fps-cap watchdog killed the reader, tearing down the RTSP session, breaking ffmpeg's pipe, dropping the MediaMTX path, and cascading into `404 Not Found` on Frigate's restart.
+- **Fixed-CFR `setts`** (`setts=pts=N*K:dts=N*K:time_base=1/90000`, `K = 90000/BIRDFY_FRAME_RATE`). Strictly monotonic and it cleared the muxer stall, but it labels every frame exactly `1/FRAME_RATE` apart — a *different clock* from the audio, which ffmpeg paces off its true 8 kHz µ-law sample count (≈ real wall-clock). The camera's real delivered rate wobbles (~8.6 fps measured, autoBitrate-driven) and never equals `FRAME_RATE`, so the video media clock ran ~4.5% fast against audio and **A/V drifted apart by minutes** over a long session.
+
+Current approach (`_rtp_forwarder.py`): drive **both** streams off the same real wall-clock. ffmpeg uses `-use_wallclock_as_timestamps 1` on the video input, stamping each frame at the instant it *reads* it from the pipe; `forward_video` paces each stdin write to the frame's own monotonic jitter-buffer completion time (the `pace_anchor` logic). Because we write fully assembled frames in decode order (the jitter buffer already reorders), and pace them to true completion times, ffmpeg's read-time is monotonic **and** spaced at the real delivery cadence — no DTS inversion, no muxer stall, and on the **same** clock as the audio sample count, so A/V can't drift. `BIRDFY_FRAME_RATE` no longer affects A/V sync; it only seeds the demuxer's initial fps guess (`-r`).
 
 > Downstream, point Frigate at the bridge per [Pointing Frigate at the bridge](frigate.md): hardware-decode the full-res stream rather than re-encoding a go2rtc detect substream, which avoids reintroducing the same fps-cap teardown on the substream hop.

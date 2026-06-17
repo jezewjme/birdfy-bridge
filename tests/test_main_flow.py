@@ -44,6 +44,14 @@ _DEVICE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_off_sentinel(monkeypatch, tmp_path):
+    """Redirect the off-mode healthcheck sentinel to a per-test temp path so the
+    main() loop's _set_off_sentinel calls never touch the real /tmp default. Tests
+    that assert on the sentinel re-point it to their own tmp_path file."""
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(tmp_path / "off_sentinel_default"))
+
+
 def _patch_common(monkeypatch, *, state):
     """Stub the API calls run_once/poll_state_only depend on.
 
@@ -242,11 +250,15 @@ class _ModeMqtt:
 
 
 @pytest.mark.asyncio
-async def test_main_off_mode_pauses_without_running_session(monkeypatch):
+async def test_main_off_mode_pauses_without_running_session(monkeypatch, tmp_path):
     # mode=off must NOT call run_once at all — it only waits and re-checks.
     monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
     monkeypatch.setattr(main, "MqttConfig", lambda: object())
     monkeypatch.setattr(main, "OFF_POLL_SECONDS", 0)  # no polling
+    # Point the off sentinel at a temp file so we can assert the healthcheck hint
+    # is written while paused (its presence keeps the container HEALTHY in off mode).
+    sentinel = tmp_path / "birdfy_mode_off"
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(sentinel))
 
     ran = []
 
@@ -268,14 +280,18 @@ async def test_main_off_mode_pauses_without_running_session(monkeypatch):
     assert ran == []  # never opened a session
     # Paused at the back-off cap (OFF_POLL_SECONDS=0 -> no poll cadence).
     assert sleeps == [main.BACKOFF_SCHEDULE[-1]]
+    # Off sentinel was created so the healthcheck treats not-publishing as
+    # intentional rather than restarting the container.
+    assert sentinel.exists()
 
 
 @pytest.mark.asyncio
-async def test_main_off_mode_polls_when_configured(monkeypatch):
+async def test_main_off_mode_polls_when_configured(monkeypatch, tmp_path):
     # OFF_POLL_SECONDS > 0 -> refresh sensors via poll_state_only, sleep that long.
     monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
     monkeypatch.setattr(main, "MqttConfig", lambda: object())
     monkeypatch.setattr(main, "OFF_POLL_SECONDS", 1200)
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(tmp_path / "birdfy_mode_off"))
 
     polled = []
 
@@ -299,12 +315,18 @@ async def test_main_off_mode_polls_when_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_main_offline_error_backs_off_at_cap(monkeypatch):
+async def test_main_offline_error_backs_off_at_cap(monkeypatch, tmp_path):
     # run_once raising DeviceOfflineError must route to the cap back-off and
     # continue (not crash, not count toward the failure ladder's short-session
     # branch).
     monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("auto"))
     monkeypatch.setattr(main, "MqttConfig", lambda: object())
+    # A stale off sentinel left from a previous off period must be cleared the
+    # moment we re-enter a non-off iteration, so a genuinely stuck stream can still
+    # go unhealthy.
+    sentinel = tmp_path / "birdfy_mode_off"
+    sentinel.write_text("off\n")
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(sentinel))
 
     async def fake_run_once(mqtt):
         raise DeviceOfflineError({"battery_level": 4})
@@ -322,6 +344,25 @@ async def test_main_offline_error_backs_off_at_cap(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await main.main()
     assert sleeps == [main.BACKOFF_SCHEDULE[-1]]
+    assert not sentinel.exists()  # cleared on the non-off iteration
+
+
+def test_set_off_sentinel_create_and_remove(monkeypatch, tmp_path):
+    # Direct unit test of the sentinel helper: idempotent create, idempotent
+    # remove, and a remove of an absent file is a no-op (not an error).
+    sentinel = tmp_path / "birdfy_mode_off"
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(sentinel))
+
+    main._set_off_sentinel(False)  # absent -> still absent, no raise
+    assert not sentinel.exists()
+
+    main._set_off_sentinel(True)
+    assert sentinel.exists()
+    main._set_off_sentinel(True)  # idempotent
+    assert sentinel.exists()
+
+    main._set_off_sentinel(False)
+    assert not sentinel.exists()
 
 
 @pytest.mark.asyncio

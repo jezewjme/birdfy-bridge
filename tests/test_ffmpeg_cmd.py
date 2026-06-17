@@ -1,15 +1,15 @@
 """Tests for the ffmpeg command-building in _rtp_forwarder._start_ffmpeg().
 
-The big timestamp fix in this PR: drop -fflags +genpts / -fps_mode cfr (which
-can't stamp a -c copy'd raw Annex B stream) in favor of a `setts` bitstream
-filter that assigns CFR PTS/DTS in RTP's 90 kHz timebase. The N*tick value is
-90000 // FRAME_RATE, so it MUST track BIRDFY_FRAME_RATE — a stale hard-coded
-tick against a different rate would mislabel timing and play back in slow motion.
+The current timestamp approach: drive BOTH video and audio off the same real
+wall-clock so A/V can't drift. Video uses -use_wallclock_as_timestamps on the
+input (forward_video paces stdin writes to each frame's true completion time, so
+ffmpeg's read-time reproduces the real delivery cadence); audio keeps its 8 kHz
+µ-law sample clock. The earlier fixed-CFR `setts` filter was removed because a
+constant FRAME_RATE could not track the camera's wobbling delivered rate and so
+drifted against audio's true sample clock.
 
 We capture the argv handed to subprocess.Popen instead of spawning ffmpeg.
 """
-import importlib
-
 import pytest
 
 pytest.importorskip("aiortc", reason="_rtp_forwarder imports aiortc at module load")
@@ -34,47 +34,25 @@ def capture_popen(monkeypatch):
     return _FakePopen
 
 
-def _setts_arg(cmd):
-    """Return the value following -bsf:v in the captured argv."""
-    i = cmd.index("-bsf:v")
-    return cmd[i + 1]
-
-
-def test_uses_setts_not_genpts_or_fps_mode(capture_popen):
+def test_uses_input_wallclock_not_setts_genpts_or_fps_mode(capture_popen):
     _rtp_forwarder._start_ffmpeg("rtsp://localhost:8554/birdfy")
     cmd = capture_popen.last_cmd
-    # The whole point of the fix: setts present, the old knobs gone.
-    assert "-bsf:v" in cmd
+    # Timing now comes from input wallclock timestamps; the old per-frame knobs
+    # are all gone (setts CFR drifted vs audio; genpts/fps_mode can't stamp copy).
+    assert cmd[cmd.index("-use_wallclock_as_timestamps") + 1] == "1"
+    assert "-bsf:v" not in cmd
     assert "+genpts" not in cmd
     assert "-fps_mode" not in cmd
 
 
-def test_setts_uses_90khz_timebase_and_default_rate(capture_popen):
-    # Default FRAME_RATE is 9 (the camera's measured delivered rate) -> the tick
-    # is 90000 // 9 == 10000. Derive it from the module so this tracks the default
-    # rather than re-hard-coding a number that drifts from the source.
-    tick = 90000 // _rtp_forwarder.FRAME_RATE
+def test_wallclock_applies_to_video_input(capture_popen):
+    # -use_wallclock_as_timestamps must precede the video input (-i pipe:0) so it
+    # binds to that demuxer, not to a later one.
     _rtp_forwarder._start_ffmpeg("rtsp://localhost:8554/birdfy")
-    arg = _setts_arg(capture_popen.last_cmd)
-    assert _rtp_forwarder.FRAME_RATE == 9
-    assert arg == f"setts=pts=N*{tick}:dts=N*{tick}:time_base=1/90000"
-
-
-def test_setts_tick_tracks_frame_rate_override(monkeypatch, capture_popen):
-    # Override BIRDFY_FRAME_RATE and reload so FRAME_RATE re-reads the env; the
-    # setts tick must recompute to 90000 // rate, never stay at 6000.
-    monkeypatch.setenv("BIRDFY_FRAME_RATE", "30")
-    mod = importlib.reload(_rtp_forwarder)
-    monkeypatch.setattr(mod.subprocess, "Popen", _FakePopen)
-    try:
-        mod._start_ffmpeg("rtsp://localhost:8554/birdfy")
-        arg = _setts_arg(_FakePopen.last_cmd)
-        assert mod.FRAME_RATE == 30
-        assert arg == "setts=pts=N*3000:dts=N*3000:time_base=1/90000"  # 90000//30
-    finally:
-        # Reload again with the env cleared so other tests see the default rate.
-        monkeypatch.delenv("BIRDFY_FRAME_RATE", raising=False)
-        importlib.reload(_rtp_forwarder)
+    cmd = capture_popen.last_cmd
+    wc = cmd.index("-use_wallclock_as_timestamps")
+    video_in = cmd.index("pipe:0")
+    assert wc < video_in
 
 
 def test_video_passthrough_and_rtsp_tcp(capture_popen):

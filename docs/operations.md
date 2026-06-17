@@ -15,6 +15,7 @@ The Docker `HEALTHCHECK` uses MediaMTX's control API (`http://127.0.0.1:9997`) r
 
 The healthcheck operates in layers (see [`docker/healthcheck.py`](../docker/healthcheck.py)):
 
+0. **Bridge intentionally `off`** (off sentinel present) → `HEALTHY`, short-circuit. In `off` mode the bridge never publishes by design, so without this the grace window below would expire and Docker would restart a perfectly healthy container. The bridge touches `BIRDFY_OFF_SENTINEL` (default `/tmp/birdfy_mode_off`) while off and removes it on any non-off iteration.
 1. **MediaMTX dead** (control API unreachable) → immediate `UNHEALTHY`, no grace.
 2. **`birdfy` path publishing** (`ready: true`) → `HEALTHY`, reset down-timer.
 3. **Not publishing, down < grace window** → `HEALTHY` (tolerate reconnects and camera sleep).

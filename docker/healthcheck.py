@@ -24,6 +24,9 @@ Stdlib only (no pip deps in the healthcheck path). Tunables via env:
   HEALTHCHECK_PATH        RTSP/MediaMTX path name        (default: birdfy)
   HEALTHCHECK_API         MediaMTX control API base      (default: http://127.0.0.1:9997)
   HEALTHCHECK_GRACE_SEC   down-duration before unhealthy (default: 300 = 5 min)
+  BIRDFY_OFF_SENTINEL     file the bridge touches while intentionally in `off`
+                          mode; its presence forces HEALTHY (default:
+                          /tmp/birdfy_mode_off)
 """
 import json
 import os
@@ -35,6 +38,14 @@ import urllib.request
 PATH_NAME = os.getenv("HEALTHCHECK_PATH", os.getenv("RTSP_PATH", "birdfy"))
 API_BASE = os.getenv("HEALTHCHECK_API", "http://127.0.0.1:9997").rstrip("/")
 GRACE_SEC = int(os.getenv("HEALTHCHECK_GRACE_SEC", "300"))
+
+# When the bridge is intentionally in `off` mode it never publishes, so the
+# publish check below would (correctly) see "not ready" forever and, after the
+# grace window, report UNHEALTHY — which makes Docker restart a container that is
+# working exactly as configured. The bridge touches this sentinel while off (and
+# removes it when it leaves off), so its presence means "down on purpose → healthy".
+# Must match BIRDFY_OFF_SENTINEL in main.py.
+_OFF_SENTINEL = os.getenv("BIRDFY_OFF_SENTINEL", "/tmp/birdfy_mode_off")
 
 # Persisted "stream first seen down at" timestamp. /tmp is fine — it only needs to
 # survive between healthcheck invocations (every ~30s), not across restarts; a
@@ -98,6 +109,16 @@ def _clear_down_since() -> None:
 
 
 def main() -> int:
+    # Layer 0: intentionally off. The bridge is running fine, just not publishing
+    # by design (mode=off) — so the publish/grace logic below would wrongly flap us
+    # unhealthy and trigger a restart. Honor the off sentinel before anything else.
+    # (Still requires MediaMTX up via the next layer? No — if the operator chose
+    # off, a non-publishing MediaMTX is also expected, so off short-circuits all.)
+    if os.path.exists(_OFF_SENTINEL):
+        _clear_down_since()
+        print(f"HEALTHY: bridge in off mode (sentinel {_OFF_SENTINEL} present)")
+        return 0
+
     # Layer 1: MediaMTX itself must be up. If it's not, nothing can publish — hard
     # fail immediately (no grace). Uses the control API rather than a raw RTSP TCP
     # connect so it doesn't generate noise in the MediaMTX RTSP log.

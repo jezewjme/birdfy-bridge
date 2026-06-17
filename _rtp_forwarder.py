@@ -47,29 +47,21 @@ logger = logging.getLogger(__name__)
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
 _START_CODE = b"\x00\x00\x00\x01"
 
-# The frame rate we stamp the copied stream at (-bsf:v setts below), so output
-# timestamps are clean and Frigate's fps-cap watchdog doesn't tear the stream down.
+# Seed for the raw-H264 demuxer's fps guess (ffmpeg `-r`). This is NO LONGER the
+# A/V-sync-critical value it once was: output timing now comes from
+# -use_wallclock_as_timestamps on paced writes (see _start_ffmpeg), which rides
+# the camera's true delivered cadence — so video can't drift against audio even if
+# this number is off. It only nudges the demuxer away from an odd default before
+# wallclock stamping takes over.
 #
-# IMPORTANT: this MUST match the camera's real *delivered* rate. It is NOT a
-# throttle. Because we -c copy (no re-encode), ffmpeg can't resample to this
-# value; it only assigns timestamps as if each frame is 1/FRAME_RATE apart. Set
-# it wrong and you don't drop frames — you mislabel timing:
-#   too low  → output runs in slow motion and a/v drifts;
-#   too high → the output's media clock runs faster than wall-clock, so Frigate's
-#              fps-cap watchdog trips and tears the stream down (the go2rtc
-#              "error=EOF" / reconnect churn, and "exceeded fps limit" kills).
-#
-# The camera's SDP *advertises* 15 fps, but its adaptive encoder (the autoBitrate
-# control seen on the data channel) actually delivers ~9 fps sustained — measured
-# from the forwarder's own frame-count logs across multiple sessions (e.g. 2500
-# frames over ~287s ≈ 8.7 fps). A hard-coded 15 was therefore ~1.7x too fast and
-# was the real cause of the Frigate fps-cap teardowns. 9 matches the observed
-# delivery; the residual second-to-second wobble (~8-11 fps) is absorbed by the
-# jitter buffer + RTSP and does not trip the cap.
-#
-# If a future device/firmware delivers a different sustained rate, set
-# BIRDFY_FRAME_RATE to match it (confirm against the "N frames / M bytes
-# forwarded" log lines: fps ≈ Δframes / Δseconds).
+# HISTORY (kept because the failure modes still inform tuning): we used to stamp a
+# fixed CFR via `-bsf:v setts=N*(90000/FRAME_RATE)`, where FRAME_RATE HAD to match
+# the real delivered rate or the media clock ran fast/slow. The SDP advertises
+# 15 fps but autoBitrate delivers ~8.6–9 fps sustained (e.g. 30000 frames over
+# ~3483s ≈ 8.6 fps), so a fixed 9 ran ~4.5% fast against audio's true 8 kHz sample
+# clock and A/V drifted apart over a long session. The wallclock approach removed
+# that coupling. A wildly-high value here could still mislead the demuxer's initial
+# guess, so leaving it near the real rate is harmless and slightly safer.
 #
 # To reduce Frigate's *detection* CPU, set `detect: fps:` in the Frigate camera
 # config instead — that's a separate downstream knob and doesn't belong here.
@@ -235,45 +227,55 @@ def _unwrap_jitter_buffer(receiver) -> None:
 def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subprocess.Popen:
     """Start ffmpeg in H264-passthrough mode writing to RTSP.
 
-    Timestamps: the raw Annex B stream we feed in has no container timing.
-      * -use_wallclock_as_timestamps stamps at *arrival* time, but NACK-recovered
-        frames arrive out of order so wall-clock DTS goes backwards → "Non-
-        monotonous DTS" → Frigate fps-cap teardown (404 cascade). Rejected.
+    Timestamps — the raw Annex B stream we feed in has no container timing, so we
+    must synthesize it. History of what does NOT work under `-c copy`:
       * -fflags +genpts / -fps_mode cfr cannot stamp a *copied* raw stream: they
         dup/drop against input timestamps, and raw Annex B under -c copy has none.
         Packets reached the RTSP muxer with unset PTS, ffmpeg 5.1 logged
         "Timestamps are unset in a packet", and the muxer stalled to speed≈0.2x —
         backpressuring stdin so our hand-off queue overflowed (multi-second skips).
-    Fix: assign timestamps directly on the copied stream with the setts bitstream
-    filter, in RTP's native 90 kHz timebase (-bsf:v setts=pts=N*K:dts=N*K:
-    time_base=1/90000, where K = 90000/FRAME_RATE). Frame N is stamped at
-    N/FRAME_RATE seconds — perfectly monotonic CFR, independent of arrival order,
-    no decode. Verified in-container that this clears the "Timestamps are unset"
-    muxer stall that +genpts alone does not. FRAME_RATE must match the camera's
-    real *delivered* rate (~9 fps measured; the 15 fps the SDP advertises is the
-    encoder ceiling, not what autoBitrate actually sends) — see the FRAME_RATE
-    note above. The stream has no B-frames (only SLICE/IDR NALs) so PTS==DTS.
+      * -bsf:v setts=pts=N*K (fixed CFR at FRAME_RATE) DID clear that stall and is
+        monotonic, but it labels every frame as exactly 1/FRAME_RATE apart. That is
+        a *different clock* from the audio, which ffmpeg paces off its true 8 kHz
+        µ-law sample count (≈ real wall-clock). The camera's real delivered rate
+        wobbles (~8.6 fps measured, autoBitrate-driven) and never exactly equals
+        FRAME_RATE, so the video media clock ran fast relative to audio's real
+        clock — ~4.5% at FRAME_RATE=9 — and A/V drifted apart by minutes over a
+        long session. The fixed CFR can't track a variable real rate.
+
+    Current fix — drive BOTH streams off the same real wall-clock so they cannot
+    drift. We use -use_wallclock_as_timestamps 1 on the video input: ffmpeg stamps
+    each frame at the instant it *reads* it from pipe:0. The earlier rejection of
+    wallclock (NACK-recovered frames arrive out of order → DTS goes backwards) was
+    about raw RTP *packet* arrival; we do not write packets. We write fully
+    assembled frames that aiortc's jitter buffer already hands us in decode order,
+    and forward_video paces each write to the frame's own monotonic completion time
+    (the `pace_anchor` logic in its main loop), so ffmpeg's read-time is monotonic
+    AND spaced at the true delivered cadence — no DTS inversion. Audio keeps its
+    8 kHz sample clock; both now reference the same real time. FRAME_RATE no longer
+    affects A/V sync (it only seeds the demuxer's fps guess via -r below).
 
     -c copy: no re-encode (the whole point of this path).
 
     audio_read_fd: if given, ffmpeg reads raw PCMU (µ-law) audio from this fd as a
     second input (pipe:<fd>) and copies it into the RTSP output (-c:a copy). The
-    fd is inherited by the child via Popen(pass_fds=...). We let ffmpeg derive the
-    audio PTS from the sample clock (-f mulaw -ar 8000): that is naturally
-    monotonic and starts at 0, matching the video's genpts-from-0, so the two
-    inputs stay roughly aligned without a separate wall-clock. Passing None keeps
-    the original video-only behavior byte-for-byte.
+    fd is inherited by the child via Popen(pass_fds=...). ffmpeg derives the audio
+    PTS from the sample clock (-f mulaw -ar 8000) — the same real-time basis the
+    paced video writes now use, so the two inputs stay aligned. Passing None keeps
+    the original video-only behavior.
     """
     cmd = [
         "ffmpeg", "-y",
-        # Hint the raw-H264 demuxer at the camera's rate. NOTE: with `-f h264`
-        # + `-c copy`, neither this nor `-fflags +genpts` actually stamps the
-        # packets — raw Annex B carries no timing and copy bypasses any rate
-        # filter, so packets reached the RTSP muxer with *unset* PTS. ffmpeg 5.1
-        # then logged "Timestamps are unset in a packet" and the muxer stalled to
-        # speed=0.196x (input pipe backpressured → our queue overflowed → frame
-        # drops / multi-second skips). The `-bsf:v setts` below is what actually
-        # assigns CFR timestamps; this -r just keeps the demuxer's fps guess sane.
+        # Stamp each video frame at the wall-clock instant ffmpeg reads it from
+        # pipe:0. forward_video paces its stdin writes to each frame's monotonic
+        # completion time (the pace_anchor logic), so read-time == real delivery:
+        # monotonic, correctly spaced, and on the SAME clock as the audio sample
+        # count. This is what keeps A/V locked regardless of the wobbling delivered
+        # rate (a fixed CFR could not — see the timestamps note above).
+        "-use_wallclock_as_timestamps", "1",
+        # Seed the raw-H264 demuxer's fps guess. With wallclock timestamps this no
+        # longer sets the output pacing (the read-time does), but a sane -r keeps
+        # the demuxer from assuming an odd default.
         "-r", str(FRAME_RATE),
     ]
     if audio_read_fd is not None:
@@ -302,26 +304,12 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         ]
     cmd += [
         "-c:v", "copy",
-        # Synthesize constant-rate, strictly-monotonic timestamps on the *copied*
-        # H264 stream. Neither `-fps_mode cfr` nor `-fflags +genpts` can do this
-        # under `-c copy`: they dup/drop against *input* timestamps, but raw Annex
-        # B has none. Packets reached the RTSP muxer with unset PTS — ffmpeg 5.1
-        # logged "Timestamps are unset in a packet" and the muxer stalled to
-        # speed≈0.2x (input pipe backpressured → our hand-off queue overflowed →
-        # multi-second skips). Verified in-container: genpts alone does NOT clear
-        # that warning on an mpegts/RTSP (90 kHz) muxer; setts does.
-        #
-        # The setts bitstream filter assigns timing directly, no decode:
-        #   time_base=1/90000  → RTSP/RTP's native 90 kHz clock
-        #   pts=dts=N*K        → frame N at N*(90000/FRAME_RATE) ticks = N/FRAME_RATE s
-        # K = 90000/FRAME_RATE (e.g. 10000 at 9 fps). Independent of arrival order
-        # / NACK-recovery jitter, so DTS is always monotonic (no "Non-monotonous
-        # DTS" → no Frigate fps-cap teardown) and the stream is real-time-paced
-        # regardless of bursty delivery. The camera has no B-frames (only SLICE/IDR
-        # NALs) so PTS==DTS. FRAME_RATE must track the real delivered rate (see the
-        # FRAME_RATE note above); a too-high value here makes the clock run fast.
-        "-bsf:v",
-        f"setts=pts=N*{90000 // FRAME_RATE}:dts=N*{90000 // FRAME_RATE}:time_base=1/90000",
+        # No -bsf:v setts here: timing now comes from -use_wallclock_as_timestamps
+        # on the input (paced writes via the pace_anchor logic), which shares the
+        # audio's real clock. The old `setts=pts=N*K` synthesized a fixed CFR that
+        # drifted against audio's true sample clock — see the timestamps note in
+        # this function's docstring. The camera has no B-frames (only SLICE/IDR
+        # NALs) so PTS==DTS regardless.
     ]
     if audio_read_fd is not None:
         # PCMU is a native RTP/RTSP payload — copy it through, no re-encode.
@@ -454,7 +442,12 @@ async def forward_video(
     via a second ffmpeg input (-c:a copy). The video path is unchanged when no
     audio receiver is supplied or audio is disabled.
     """
-    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    # Each item is (monotonic_completion_time, frame_bytes). We capture the time
+    # the jitter buffer completed the frame so the writer can pace it to ffmpeg at
+    # its true delivery cadence — that paced read-time is what -use_wallclock_as_
+    # timestamps stamps, keeping video on the same real clock as the audio sample
+    # count (see _start_ffmpeg's timestamps note and the pace_anchor logic below).
+    queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
     # Rate-limit the "queue full" warning: a burst overflow would otherwise emit
     # hundreds of identical lines per second. We coalesce into one WARNING every
     # ~2s carrying the running drop count so the signal survives without the spam.
@@ -466,7 +459,7 @@ async def forward_video(
         if not jf.data:
             return
         try:
-            queue.put_nowait(jf.data)
+            queue.put_nowait((time.monotonic(), jf.data))
         except asyncio.QueueFull:
             drop_state["count"] += 1
             now = time.monotonic()
@@ -558,10 +551,18 @@ async def forward_video(
     # and was never restarted, leaving MediaMTX with "no stream is available").
     garbage_frames_skipped = 0
     ffmpeg_restarts = 0
+    # Pacing reference for -use_wallclock_as_timestamps: we release each video
+    # frame to ffmpeg's stdin at its true completion cadence so ffmpeg's read-time
+    # (which it stamps the frame at) reproduces the real delivery timeline — the
+    # same wall-clock the audio sample count rides. `pace_anchor` is (wall, frame
+    # ts) captured at the first write after each (re)start; subsequent frames sleep
+    # until wall + (frame_ts - anchor_frame_ts). Reset to None on every ffmpeg
+    # (re)start so a fresh process re-anchors instead of replaying an old offset.
+    pace_anchor: tuple[float, float] | None = None
     try:
         while True:
             try:
-                data = await asyncio.wait_for(queue.get(), timeout=frame_timeout)
+                frame_ts, data = await asyncio.wait_for(queue.get(), timeout=frame_timeout)
             except asyncio.TimeoutError:
                 logger.warning("RTP forwarder: no frame for %ss — exiting", frame_timeout)
                 return
@@ -668,6 +669,7 @@ async def forward_video(
                         )
                     continue
                 proc, audio_pump = _start_av_ffmpeg()
+                pace_anchor = None  # re-anchor pacing on the first write below
                 logger.info(
                     "RTP forwarder: ffmpeg started after %d pre-IDR drops, first IDR frame %d bytes (audio=%s)",
                     pre_proc_frames_dropped,
@@ -698,6 +700,24 @@ async def forward_video(
                 out = params.sps + params.pps + data  # type: ignore[operator]
             else:
                 out = data
+
+            # Pace the write to this frame's true completion time so ffmpeg reads
+            # (and wallclock-stamps) it at the real delivery cadence. The first
+            # frame after a (re)start anchors the timeline and writes immediately;
+            # each later frame sleeps until its captured offset elapses. We clamp
+            # the sleep: never sleep on a frame that's already "late" (offset <=
+            # elapsed), and cap a single sleep so a clock glitch or a long jitter-
+            # buffer stall (which legitimately bunches frames) can't wedge the loop
+            # — a burst released together is then written back-to-back, exactly
+            # mirroring the bunched real timestamps, so DTS stays monotonic.
+            if pace_anchor is None:
+                pace_anchor = (loop.time(), frame_ts)
+            else:
+                anchor_wall, anchor_ts = pace_anchor
+                target = anchor_wall + (frame_ts - anchor_ts)
+                delay = target - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(min(delay, frame_timeout))
 
             try:
                 # Blocking write — offload to our dedicated single-thread pool so
