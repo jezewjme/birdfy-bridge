@@ -2,9 +2,7 @@
 
 An interoperability tool that converts a Birdfy / Netvue camera's WebRTC stream into RTSP so it can be consumed by Frigate, go2rtc, VLC, Home Assistant, or anything else that speaks RTSP.
 
-> **Unofficial, unaffiliated client.** Not endorsed by, sponsored by, or affiliated with Netvue Inc., Birdfy, Vicohome, or Addx. "Birdfy", "Netvue", "Vicohome", and "Addx" are trademarks of their respective owners and are used here only nominatively to identify the cameras this tool interoperates with.
->
-> This project is for use with cameras **you own**. Using it may violate Netvue's Terms of Service and could result in your Birdfy account being suspended or terminated — use a **dedicated account**, not your primary one. The project ships with no warranty (see [LICENSE](LICENSE)).
+> **Unofficial, unaffiliated client.** Not endorsed by, sponsored by, or affiliated with Netvue Inc., Birdfy, Vicohome, or Addx. "Birdfy", "Netvue", "Vicohome", and "Addx" are trademarks of their respective owners and are used here only nominatively to identify the cameras this tool interoperates with. See [Disclaimer](#disclaimer) for terms-of-service and warranty notes.
 
 ## Status
 
@@ -50,33 +48,37 @@ From another host: `rtsp://<host-running-birdfy-bridge>:8554/birdfy`.
 
 You can bypass the bundled MediaMTX entirely and publish straight to Frigate's go2rtc by setting `RTSP_OUTPUT=rtsp://frigate:8554/birdfy` in `.env`.
 
-#### Recommended setup: use a downscaled detect substream
+#### Recommended setup: hardware-decode the full-res stream, let Frigate downscale
 
-The bridge outputs a single **1920×1080** H264 stream. If you point Frigate's `detect` role straight at it, Frigate's ffmpeg has to **software-decode full 1080p** for every analyzed frame — which shows up as high ffmpeg CPU (e.g. a "high FFmpeg CPU usage" warning). The camera only offers one WebRTC stream, so there's no native substream to fall back on.
+The bridge outputs a single **1920×1080** H264 stream. The CPU concern with `detect` is the **decode**, not the resolution: if Frigate *software*-decodes 1080p for every analyzed frame, ffmpeg CPU spikes (you'll see a "high FFmpeg CPU usage" warning). The fix is to **hardware-decode** the full-res stream and let Frigate downscale to the detect size on the GPU. No separate substream is needed.
 
-The fix is to let **go2rtc** create a downscaled detect stream from the single bridge feed, and split Frigate's roles so `detect` reads the small stream while `record`/`live` keep full resolution:
+Point both `detect` and `record` at the one `birdfy` stream, give the camera `hwaccel_args`, and set `detect: width/height` to the small analysis size — Frigate decodes once on the iGPU and scales there:
 
 ```yaml
 go2rtc:
-  streams:
-    # Full-res stream — one connection to the bridge.
+  # Keep the bridge stream warm so detect recovers in ~1s when the feeder camera
+  # wakes from sleep, instead of waiting for a reactive respawn (avoids the
+  # record-maintainer "unprocessed recording segments" stall). Needs go2rtc ≥ 1.9.11.
+  preload:
     birdfy:
-      - rtsp://birdfy-bridge:8554/birdfy
-    # Downscaled detect substream. Sourcing from the go2rtc "birdfy" stream
-    # (not the bridge URL) reuses that single bridge connection; go2rtc just
-    # fans it out. Use #hardware if your host has a GPU (e.g. Intel VAAPI);
-    # drop it to scale on CPU (still cheap at 640x360).
-    birdfy_sub:
-      - "ffmpeg:birdfy#video=h264#hardware#width=640#height=360"
+  streams:
+    # Single connection to the bridge. #audio=aac transcodes the bridge's PCMU
+    # audio to AAC so Frigate's MP4 record container can hold it (MP4 can't store
+    # pcm_mulaw). Drop the #audio=aac modifier if you record video-only.
+    birdfy:
+      - "ffmpeg:rtsp://birdfy-bridge:8554/birdfy#video=copy#audio=aac"
 
 cameras:
   BirdfyFeeder:
     ffmpeg:
-      hwaccel_args: preset-vaapi   # if you have a supported GPU
+      hwaccel_args: preset-vaapi   # Intel VAAPI; use your platform's preset
       inputs:
-        - path: rtsp://127.0.0.1:8554/birdfy_sub
+        # Detect: full-res stream, hardware-decoded and downscaled to the detect
+        # width/height on the GPU. No go2rtc substream / re-encode.
+        - path: rtsp://127.0.0.1:8554/birdfy
           input_args: preset-rtsp-restream
           roles: [detect]
+        # Record: same full-resolution stream (no quality loss on recordings).
         - path: rtsp://127.0.0.1:8554/birdfy
           input_args: preset-rtsp-restream
           roles: [record]
@@ -86,7 +88,9 @@ cameras:
       fps: 5
 ```
 
-This keeps a **single** connection to the bridge (go2rtc derives the substream internally) and drops detect-side CPU dramatically, since the detector decodes a ~9× smaller frame. Reload the Frigate config after editing — it doesn't auto-reload.
+**Why not a go2rtc detect substream?** An earlier version of this guide recommended a downscaled `birdfy_sub` stream (`ffmpeg:birdfy#video=h264#hardware#width=640#height=360`). That works, but it makes go2rtc **decode → scale → re-encode** the stream, which (a) does the GPU work *twice* — go2rtc re-encodes, then Frigate decodes the substream again — and (b) the re-encode hop is fragile on this camera's bursty, NACK-recovered link: every transcode hiccup surfaced to Frigate as `RTP: PT=60: bad cseq` / "exceeded fps limit" watchdog teardowns and a 404 restart cascade. Hardware-decoding the full-res stream directly is **one** GPU decode pass, **zero** re-encodes, and removes that failure mode entirely. Measured on an Intel N305: detect ffmpeg ~0.9% CPU and iGPU near idle — comparable to the substream's detect cost without the extra encode. If your host has *no* hardware decoder, the `birdfy_sub` re-encode approach is still a reasonable fallback to keep software decode off the full 1080p frame.
+
+Reload the Frigate config after editing — it doesn't auto-reload.
 
 ## Configuration
 
@@ -112,6 +116,14 @@ This keeps a **single** connection to the bridge (go2rtc derives the substream i
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
 | `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |
 | `BIRDFY_NACK_MAX_RETRIES`  | No | Max re-NACK re-sends per missing packet (default: `12`). |
+| `BIRDFY_STUB_VIDEO_DECODE` | No | `0` to restore aiortc's real H264 decoder. Default on (no-op decoder) — we forward via `-c copy` and never use decoded frames, so this silences the decoder's `Invalid data` warnings on this camera's bitstream. |
+| `MQTT_HOST`                | No | MQTT broker host. **Unset = MQTT disabled**; the bridge runs exactly as before. See [Home Assistant control & sensors](#home-assistant-control--sensors). |
+| `MQTT_PORT`                | No | Broker port (default: `1883`). |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Broker credentials. Omit both for an anonymous broker. |
+| `MQTT_BASE_TOPIC`          | No | Topic prefix for state/command topics (default: `birdfy`). |
+| `MQTT_DISCOVERY_PREFIX`    | No | Home Assistant MQTT-discovery prefix (default: `homeassistant`). |
+| `BIRDFY_MODE`              | No | First-boot mode before HA publishes one: `always_on` / `auto` / `off` (default: `auto`). The HA **Mode** select overrides this at runtime. |
+| `BIRDFY_OFF_POLL_SECONDS`  | No | In `off` mode, refresh the battery/online sensors this often (default: `0` = don't poll; leave the camera alone). |
 
 ## Token persistence
 
@@ -123,10 +135,36 @@ For this to survive container recreation, `BIRDFY_STATE_DIR` must point at a per
 
 Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 
+## Home Assistant control & sensors
+
+Optional. Set `MQTT_HOST` (and credentials if your broker needs them) and the bridge connects to MQTT, **auto-creates** a device in Home Assistant via MQTT Discovery, and exposes:
+
+- **Mode** (`select`): `always_on` / `auto` / `off` — controls the bridge live.
+- **Battery** (`sensor`, `%`): the camera's last-reported charge. Alert on this in HA and a dying battery never blindsides you again.
+- **Online / Awake / Charging** (`binary_sensor`).
+
+If `MQTT_HOST` is unset, none of this runs and the bridge behaves exactly as before. MQTT outages never affect streaming — the bridge keeps running in whatever mode it last had (or `BIRDFY_MODE`).
+
+### The three modes
+
+| Mode | Behavior | Use for |
+|------|----------|---------|
+| `always_on` | Connect whenever the camera is online. | Max coverage. |
+| `auto` | Connect, but defer to the camera's **native dormancy schedule** (set in the Birdfy app). During the overnight window the camera reports offline and the bridge backs off — no wake-pokes. | Saving battery overnight while keeping daytime coverage. |
+| `off` | Pause the connect loop entirely; the camera is left alone. | Hard stop. |
+
+**Why `auto` saves the most battery:** the bridge is only a *viewer* — it can't stop the camera's own wake/detect cycles. Setting the camera's **native overnight dormancy in the Birdfy app** is what actually conserves power; `auto` simply respects the resulting offline window instead of churning reconnect attempts against a sleeping cam. The mode is read from a *retained* MQTT topic, so it survives bridge restarts.
+
+> **Battery polling in `off` mode:** reading battery requires a `selectsingledevice` call. This *may* be a passive cloud read (the state the camera last reported) that costs no camera battery — but that isn't confirmed, so `off` mode does **not** poll by default (`BIRDFY_OFF_POLL_SECONDS=0`) and the HA battery sensor simply holds its last value. If you confirm the read is passive on a healthy battery, set `BIRDFY_OFF_POLL_SECONDS=1200` for a live overnight battery sensor.
+
+### Connecting to Home Assistant's Mosquitto
+
+Point `MQTT_HOST` at the broker reachable from the bridge container (typically the HA host's LAN IP, or a shared Docker network's broker service name), set `MQTT_PORT` (1883) and `MQTT_USERNAME`/`MQTT_PASSWORD` for a dedicated MQTT user. With HA's MQTT integration enabled, the **Birdfy** device and its entities appear automatically — no YAML.
+
 ## Security warnings
 
 - **`.env` contains your full Birdfy account password.** Anyone with that file can log into your account and reach every camera, doorbell, or other Netvue device on it. Keep it out of backups, repos, and shared drives. Use a dedicated Birdfy account for the bridge if at all possible.
-- **`BIRDFY_STATE_DIR/.birdfy_auth_cache.json` contains a usable login token.** It's written `0600` and git-ignored, but treat the state volume as sensitive — a leaked token grants account access until it expires. Delete the file (or the volume) to force a fresh login.
+- **Credential storage is a known limitation.** The bridge currently caches the login token locally (see [Token persistence](#token-persistence)) rather than via an OS keychain or secrets manager. It's written `0600` and git-ignored, but treat the state volume as sensitive — a leaked token grants account access until it expires. Delete the file (or the volume) to force a fresh login. **Roadmap:** pluggable secrets-manager backend (e.g. `keyring`, Vault) for the cached token.
 - **The bundled MediaMTX has no authentication.** This is fine on a trusted LAN. **Do not expose port 8554 to the public internet** — anyone who can reach it can pull your stream. If you must, configure `publishUser` / `readUser` in `docker/mediamtx.yml` and put the container behind a reverse proxy.
 - **DEBUG logs may still contain non-secret identifying data** (device serials, region info, ICE server URLs). Bearer tokens, signed URLs, refresh tokens, and AWS credentials are redacted, but treat DEBUG logs as semi-sensitive when sharing them in bug reports.
 - **Netvue's API is reverse-engineered, not contracted.** It can change at any time. The bridge fails loudly when it does; please open an issue if your account suddenly stops authenticating or device-list returns 4xx.
@@ -138,6 +176,7 @@ Set `NVS_NO_TOKEN_CACHE=1` to opt out and always log in fresh.
 - **Token refresh is best-effort**: On token expiry the bridge attempts a `refreshToken`-based renewal before falling back to a full re-login (which is what triggers Netvue's "new device logged in" email). The exact refresh endpoint isn't confirmed from packet captures, so the renewal tries a few plausible request shapes — the full login backstops it. Disable with `NVS_NO_TOKEN_REFRESH=1`.
 - **Audio is POSIX-only**: The camera's PCMU (G.711 µ-law) audio track is muxed into the RTSP output with `-c:a copy` (no re-encode). Requires a POSIX host (uses `pass_fds`); degrades to video-only on other platforms. Disable with `BIRDFY_AUDIO=0`.
 - **Healthcheck grace window**: The container healthcheck verifies the `birdfy` path is actively publishing, with a grace window to tolerate normal reconnects — a dead stream takes up to ~5 minutes to surface as unhealthy (see [Container healthcheck](#container-healthcheck)).
+- **Offline / sleeping cameras**: Battery cameras sleep and report `online: 0` between events (and a dead battery takes them fully offline). Before each connection the bridge reads the device's live state and, if it's offline, logs `Device state: online=0 … battery=N%` and **skips the WebRTC handshake**, backing off instead of churning futile reconnects (which would only burn battery waking the cloud). This is expected — the bridge resumes automatically when the camera returns. If MQTT is configured, battery/online are also exposed as HA sensors so you can alert before it dies.
 
 ## How it works
 
@@ -174,8 +213,12 @@ The Birdfy / Netvue cloud API uses a custom auth scheme reverse-engineered from 
    re-encodes anyway. Instead we tap aiortc's jitter buffer between depayload and
    decode, pull the reassembled Annex B frames, and pipe them to an
    `ffmpeg -c copy -f rtsp` passthrough (see [`_rtp_forwarder.py`](_rtp_forwarder.py)).
-   No decode, no re-encode. See [RTP receive-path quirks](#rtp-receive-path-quirks)
-   for the keyframe-recovery and timestamp fixes that make this reliable.
+   No decode, no re-encode. Because we never use the decoder's output, aiortc's
+   video decoder is replaced with a no-op (see `BIRDFY_STUB_VIDEO_DECODE`) — this
+   stops the noisy `H264Decoder() failed to decode` warnings the libavcodec
+   decoder emits on this bitstream, which got louder after the `av` bump. See
+   [RTP receive-path quirks](#rtp-receive-path-quirks) for the keyframe-recovery
+   and timestamp fixes that make this reliable.
 
 ### KVS WebRTC path (`onAddx: false` — not yet implemented)
 
@@ -225,7 +268,9 @@ The camera's keyframes are large (~25–52 KB ≈ 50–110 RTP packets of FU-A f
 
 The passthrough ffmpeg originally stamped frames at arrival wall-clock time. But NACK-recovered and reordered frames arrive out of order, so wall-clock DTS went backwards (`Non-monotonous DTS` in ffmpeg logs) and the stream looked like ~30 fps to Frigate. Frigate's fps-cap watchdog then killed its reader, which tore down the RTSP session, broke our ffmpeg's pipe, and dropped the MediaMTX path — after which Frigate's restart hit `404 Not Found` in a restart cascade.
 
-Fixed in `_rtp_forwarder.py` by declaring the input as constant `BIRDFY_FRAME_RATE` fps (default 15, the camera's negotiated rate) and forcing CFR output, so ffmpeg emits clean monotonic timestamps regardless of how jittery our frame delivery is.
+Fixed in `_rtp_forwarder.py` by assigning constant-rate, strictly-monotonic timestamps directly on the copied stream with ffmpeg's `setts` bitstream filter, in RTP's native 90 kHz timebase (`setts=pts=N*6000:dts=N*6000:time_base=1/90000`, where `6000 = 90000/BIRDFY_FRAME_RATE`). Frame N is stamped at `N/BIRDFY_FRAME_RATE` seconds — perfectly monotonic CFR, independent of arrival order, no decode. Neither `-fps_mode cfr` nor `-fflags +genpts` works here: under `-c copy` they dup/drop against *input* timestamps, but raw Annex B has none, so packets reached the RTSP muxer with unset PTS and the muxer stalled (`Timestamps are unset in a packet`, speed ≈ 0.2×) — backpressuring our hand-off queue into multi-second skips. The `setts` filter is what actually clears that. `BIRDFY_FRAME_RATE` (default 15, the camera's negotiated rate) must match the camera's real encode rate — it assigns timing, it does not throttle.
+
+> Downstream, point Frigate at the bridge per [Pointing Frigate at the bridge](#pointing-frigate-at-the-bridge): hardware-decode the full-res stream rather than re-encoding a go2rtc detect substream, which avoids reintroducing the same fps-cap teardown on the substream hop.
 
 ### Container healthcheck
 
@@ -256,13 +301,18 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more.
 ### Python (`requirements.txt`)
 - `aiortc` — WebRTC library (handles SDP, ICE, H264 depayload). Patched at runtime; see [RTP receive-path quirks](#rtp-receive-path-quirks).
 - `aiohttp` — async HTTP for API calls
-- `websockets` — WebSocket client for signaling
-- `av`, `numpy` — pulled in by aiortc (we don't decode video ourselves)
+- `websockets` — WebSocket client for signaling. Works on both the legacy (`<14`) and modern asyncio (`>=14`) APIs — the `extra_headers`→`additional_headers` rename is handled at runtime, so the version is unpinned across that boundary.
+- `aiomqtt` — optional; only used when `MQTT_HOST` is set (see [Home Assistant control & sensors](#home-assistant-control--sensors)).
+- `av`, `numpy` — pulled in by aiortc (we don't decode video ourselves; the decoder is stubbed to a no-op)
 
 ### System (Docker image installs these)
 - `ffmpeg` — H264 passthrough (`-c copy`) + push RTSP (no re-encode)
 - `mediamtx` — bundled RTSP server (latest release fetched at build time)
 - `s6-overlay` — process supervisor for running mediamtx + bridge together
+
+## Disclaimer
+
+This project is for use with cameras **you own**. Using it may violate Netvue's Terms of Service and could result in your Birdfy account being suspended or terminated. The Netvue API is reverse-engineered (see [How it works](#how-it-works)) and can change or break at any time without notice. The project ships with no warranty (see [LICENSE](LICENSE)).
 
 ## License
 

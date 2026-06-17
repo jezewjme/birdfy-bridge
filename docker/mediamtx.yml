@@ -9,6 +9,15 @@ logDestinations: [stdout]
 rtspAddress: :8554
 rtspTransports: [tcp, udp]
 
+# Publisher/reader socket timeouts. Default is 10s; the in-container ffmpeg
+# remux (-c copy) occasionally falls slightly behind realtime and goes briefly
+# silent, which tripped the 10s read timeout and dropped the publisher — kicking
+# off a reconnect/restart cascade. 30s tolerates a transient ffmpeg hiccup
+# without flapping the path. (The real fix is the non-blocking stdin write in
+# _rtp_forwarder.py; this is defense in depth.)
+readTimeout: 30s
+writeTimeout: 30s
+
 # Control API — used ONLY by the container healthcheck to ask whether the
 # 'birdfy' path is actively publishing (ready:true). Bound to localhost so it is
 # never reachable off the container; no metrics/pprof exposed. See Dockerfile

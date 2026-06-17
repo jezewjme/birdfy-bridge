@@ -88,6 +88,8 @@ async def _listen_websocket(ticket: dict, timeout: int = 10):
     """Connect to the signaling WS and log whatever the server sends."""
     import websockets
 
+    from webrtc_client import _ws_header_kwargs
+
     url = (
         f"{ticket['signalServer']}/{ticket['groupId']}"
         f"/{ticket['role']}/{ticket['id']}"
@@ -100,7 +102,7 @@ async def _listen_websocket(ticket: dict, timeout: int = 10):
 
     async with websockets.connect(
         url,
-        extra_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
+        **_ws_header_kwargs({"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"}),
         ping_interval=None,
         open_timeout=10,
     ) as ws:

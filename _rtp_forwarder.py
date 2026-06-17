@@ -23,6 +23,8 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from aiortc.jitterbuffer import JitterBuffer, JitterFrame
 
@@ -46,9 +48,32 @@ logger = logging.getLogger(__name__)
 _START_CODE = b"\x00\x00\x00\x01"
 
 # The camera's negotiated frame rate (confirmed in ffmpeg's input probe: "15 fps").
-# We feed ffmpeg as constant-rate at this value so output timestamps are clean and
-# Frigate's fps-cap watchdog doesn't tear the stream down. Override via env.
+# We stamp the copied stream at this exact rate (-bsf:v setts below), so output
+# timestamps are clean and Frigate's fps-cap watchdog doesn't tear the stream down.
+#
+# IMPORTANT: this MUST match the camera's real *encode* rate. It is NOT a throttle.
+# Because we -c copy (no re-encode), ffmpeg can't actually resample to this value;
+# it only assigns timestamps as if each frame is 1/FRAME_RATE apart. Set it lower
+# than the true rate and you don't drop frames — you mislabel timing, so playback
+# runs in slow motion and a/v drifts. (We learned this the hard way: BIRDFY_FRAME_
+# RATE=5 was tried as a "fix" for stream jitter; the real cause was unset PTS, see
+# the setts note in _start_ffmpeg. The 5 just distorted timing — leave this at 15.)
+#
+# To reduce Frigate's *detection* CPU, set `detect: fps:` in the Frigate camera
+# config instead — that's a separate downstream knob and doesn't belong here.
 FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "15"))
+
+# Depth of the depayload->ffmpeg hand-off queue, in frames. The camera link is
+# lossy (see the re-NACK heartbeat in _aiortc_media_patches.py): aiortc's jitter
+# buffer stalls waiting on a retransmit, then releases a *burst* of held frames at
+# once. The consumer hands each frame to ffmpeg via a blocking stdin write, so a
+# burst transiently backs up the pipe and the queue must be deep enough to ride
+# that out — otherwise it overflows and we drop frames mid-GOP (a few-second skip
+# in Frigate). NOTE: sustained (not bursty) overflow means ffmpeg itself is
+# stalled, not that this is too small — that was the unset-PTS muxer stall, fixed
+# by the setts filter (see _start_ffmpeg); don't paper over a recurrence by just
+# raising this. At 15 fps, 512 frames ≈ 34s of slack. Override via env if needed.
+QUEUE_MAXSIZE = int(os.getenv("BIRDFY_FORWARD_QUEUE", "512") or "512")
 
 # Where ffmpeg's stderr is written. We tail this into the main log on exit so
 # ffmpeg's own diagnosis ("non-existing PPS", "Invalid data", etc.) is visible
@@ -198,15 +223,22 @@ def _unwrap_jitter_buffer(receiver) -> None:
 def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subprocess.Popen:
     """Start ffmpeg in H264-passthrough mode writing to RTSP.
 
-    Timestamps: the raw Annex B stream we feed in has no container timing. We
-    previously used -use_wallclock_as_timestamps, but stamping at *arrival* wall
-    time is wrong here — NACK-recovered and reordered frames arrive out of order,
-    so wall-clock DTS goes backwards. ffmpeg then logs "Non-monotonous DTS" and
-    emits a ~30fps-looking jittery stream, which trips Frigate's fps-cap watchdog
-    and tears the whole RTSP path down (404 cascade). Instead we declare the
-    input as constant FRAME_RATE fps H264 (-r before -i) and let ffmpeg generate
-    clean monotonic PTS/DTS at that rate (-fflags +genpts, -fps_mode cfr). The
-    camera's negotiated stream is 15 fps (confirmed in ffmpeg input probe).
+    Timestamps: the raw Annex B stream we feed in has no container timing.
+      * -use_wallclock_as_timestamps stamps at *arrival* time, but NACK-recovered
+        frames arrive out of order so wall-clock DTS goes backwards → "Non-
+        monotonous DTS" → Frigate fps-cap teardown (404 cascade). Rejected.
+      * -fflags +genpts / -fps_mode cfr cannot stamp a *copied* raw stream: they
+        dup/drop against input timestamps, and raw Annex B under -c copy has none.
+        Packets reached the RTSP muxer with unset PTS, ffmpeg 5.1 logged
+        "Timestamps are unset in a packet", and the muxer stalled to speed≈0.2x —
+        backpressuring stdin so our hand-off queue overflowed (multi-second skips).
+    Fix: assign timestamps directly on the copied stream with the setts bitstream
+    filter, in RTP's native 90 kHz timebase (-bsf:v setts=pts=N*6000:dts=N*6000:
+    time_base=1/90000, where 6000 = 90000/FRAME_RATE). Frame N is stamped at
+    N/FRAME_RATE seconds — perfectly monotonic CFR, independent of arrival order,
+    no decode. Verified in-container that this clears the "Timestamps are unset"
+    muxer stall that +genpts alone does not. The camera's negotiated stream is
+    15 fps (confirmed in input probe) and has no B-frames, so PTS==DTS is correct.
 
     -c copy: no re-encode (the whole point of this path).
 
@@ -220,10 +252,14 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
     """
     cmd = [
         "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        # Treat the headerless H264 we pipe in as constant FRAME_RATE fps so
-        # ffmpeg assigns evenly-spaced, monotonic timestamps regardless of how
-        # jittery our frame delivery is.
+        # Hint the raw-H264 demuxer at the camera's rate. NOTE: with `-f h264`
+        # + `-c copy`, neither this nor `-fflags +genpts` actually stamps the
+        # packets — raw Annex B carries no timing and copy bypasses any rate
+        # filter, so packets reached the RTSP muxer with *unset* PTS. ffmpeg 5.1
+        # then logged "Timestamps are unset in a packet" and the muxer stalled to
+        # speed=0.196x (input pipe backpressured → our queue overflowed → frame
+        # drops / multi-second skips). The `-bsf:v setts` below is what actually
+        # assigns CFR timestamps; this -r just keeps the demuxer's fps guess sane.
         "-r", str(FRAME_RATE),
     ]
     if audio_read_fd is not None:
@@ -252,10 +288,25 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         ]
     cmd += [
         "-c:v", "copy",
-        # Constant frame rate output: pad/drop to keep DTS strictly monotonic so
-        # downstream (Frigate) sees a stable rate and doesn't fps-cap-kill us.
-        "-fps_mode", "cfr",
-        "-r", str(FRAME_RATE),
+        # Synthesize constant-rate, strictly-monotonic timestamps on the *copied*
+        # H264 stream. Neither `-fps_mode cfr` nor `-fflags +genpts` can do this
+        # under `-c copy`: they dup/drop against *input* timestamps, but raw Annex
+        # B has none. Packets reached the RTSP muxer with unset PTS — ffmpeg 5.1
+        # logged "Timestamps are unset in a packet" and the muxer stalled to
+        # speed≈0.2x (input pipe backpressured → our hand-off queue overflowed →
+        # multi-second skips). Verified in-container: genpts alone does NOT clear
+        # that warning on an mpegts/RTSP (90 kHz) muxer; setts does.
+        #
+        # The setts bitstream filter assigns timing directly, no decode:
+        #   time_base=1/90000  → RTSP/RTP's native 90 kHz clock
+        #   pts=dts=N*6000     → frame N at N*(90000/FRAME_RATE) ticks = N/FRAME_RATE s
+        # 6000 = 90000/15. Independent of arrival order / NACK-recovery jitter, so
+        # DTS is always monotonic (no "Non-monotonous DTS" → no Frigate fps-cap
+        # teardown) and the stream is real-time-paced regardless of bursty
+        # delivery. The camera has no B-frames (only SLICE/IDR NALs) so PTS==DTS.
+        # NOTE: 6000 hard-codes FRAME_RATE=15; recomputed below if overridden.
+        "-bsf:v",
+        f"setts=pts=N*{90000 // FRAME_RATE}:dts=N*{90000 // FRAME_RATE}:time_base=1/90000",
     ]
     if audio_read_fd is not None:
         # PCMU is a native RTP/RTSP payload — copy it through, no re-encode.
@@ -388,7 +439,11 @@ async def forward_video(
     via a second ffmpeg input (-c:a copy). The video path is unchanged when no
     audio receiver is supplied or audio is disabled.
     """
-    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    # Rate-limit the "queue full" warning: a burst overflow would otherwise emit
+    # hundreds of identical lines per second. We coalesce into one WARNING every
+    # ~2s carrying the running drop count so the signal survives without the spam.
+    drop_state = {"count": 0, "last_log": 0.0}
 
     def _on_frame(jf: JitterFrame) -> None:
         # Called synchronously from _handle_rtp_packet on the receive loop.
@@ -398,7 +453,16 @@ async def forward_video(
         try:
             queue.put_nowait(jf.data)
         except asyncio.QueueFull:
-            logger.warning("RTP forwarder queue full — dropping frame")
+            drop_state["count"] += 1
+            now = time.monotonic()
+            if now - drop_state["last_log"] >= 2.0:
+                logger.warning(
+                    "RTP forwarder queue full — dropping frames (%d dropped total, "
+                    "depth=%d). Link is bursty; raise BIRDFY_FORWARD_QUEUE if frequent.",
+                    drop_state["count"],
+                    QUEUE_MAXSIZE,
+                )
+                drop_state["last_log"] = now
 
     _wrap_jitter_buffer(receiver, _on_frame)
 
@@ -454,6 +518,16 @@ async def forward_video(
         pump.start_writer()
         return p, pump
 
+    loop = asyncio.get_event_loop()
+    # Dedicated single thread for ffmpeg stdin writes. proc.stdin.write blocks
+    # when ffmpeg's input pipe is full (it paces output at CFR, so a burst of
+    # held frames backs the pipe up). On the *shared* default executor that
+    # blocking call competes with the audio pump and every other run_in_executor
+    # caller — a stalled video write could starve audio (and vice versa), and a
+    # busy pool delays the next write, deepening the queue backlog. A private
+    # one-thread pool guarantees video writes are serialized only against
+    # themselves and start the instant the previous one returns.
+    write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ffmpeg-stdin")
     proc: subprocess.Popen | None = None
     params = _ParamSetCache()
     pre_proc_frames_dropped = 0
@@ -611,7 +685,15 @@ async def forward_video(
                 out = data
 
             try:
-                proc.stdin.write(out)  # type: ignore[union-attr]
+                # Blocking write — offload to our dedicated single-thread pool so
+                # a momentarily-stalled ffmpeg (full stdin pipe) can't freeze the
+                # event loop. If the loop blocks here, the RTP receive loop, audio
+                # pump, and WS heartbeat all stall, the RTSP publish goes silent,
+                # and MediaMTX times out the publisher (the ~7-min reconnect/restart
+                # cascade seen after the aiortc/av bumps changed frame pacing).
+                # write_pool (not the shared default executor) keeps these writes
+                # off the pool the audio pump and other tasks share.
+                await loop.run_in_executor(write_pool, proc.stdin.write, out)  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("RTP forwarder: ffmpeg pipe broken — will restart on next keyframe")
                 _log_ffmpeg_tail()
@@ -636,7 +718,8 @@ async def forward_video(
         logger.info(
             "RTP forwarder summary: frames_seen=%d garbage(no-start-code)=%d "
             "garbage_skipped=%d idr_total=%d frames_forwarded=%d bytes_forwarded=%d "
-            "ffmpeg_restarts=%d audio_frames=%d audio_enabled=%s ffmpeg_started=%s",
+            "ffmpeg_restarts=%d queue_drops=%d audio_frames=%d audio_enabled=%s "
+            "ffmpeg_started=%s",
             total_frames_seen,
             garbage_frames_seen,
             garbage_frames_skipped,
@@ -644,6 +727,7 @@ async def forward_video(
             frames_in,
             bytes_in,
             ffmpeg_restarts,
+            drop_state["count"],
             audio_frames_seen,
             audio_enabled,
             proc is not None,
@@ -663,3 +747,6 @@ async def forward_video(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # Tear down the dedicated writer thread. ffmpeg's stdin is closed above,
+        # so any in-flight write has unblocked; don't wait on a wedged write.
+        write_pool.shutdown(wait=False)
