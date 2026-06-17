@@ -56,18 +56,39 @@ def test_uses_setts_not_wallclock_genpts_or_fps_mode(capture_popen):
 
 
 def test_setts_uses_90khz_timebase_and_default_rate(capture_popen):
-    # Default FRAME_RATE is 9 -> tick 90000 // 9 == 10000. Derive from the module
-    # so this tracks the default rather than re-hard-coding a drifting number.
-    tick = 90000 // _rtp_forwarder.FRAME_RATE
+    # Default FRAME_RATE is the measured 8.6 -> SETTS_TICK = round(90000/8.6) =
+    # 10465. Derive from the module so this tracks the default rather than
+    # re-hard-coding a drifting number.
+    tick = _rtp_forwarder.SETTS_TICK
     _rtp_forwarder._start_ffmpeg("rtsp://localhost:8554/birdfy")
     arg = _setts_arg(capture_popen.last_cmd)
-    assert _rtp_forwarder.FRAME_RATE == 9
+    assert _rtp_forwarder.FRAME_RATE == 8.6
+    assert tick == 10465  # round(90000 / 8.6)
     assert arg == f"setts=pts=N*{tick}:dts=N*{tick}:time_base=1/90000"
 
 
-def test_setts_tick_tracks_frame_rate_override(monkeypatch, capture_popen):
-    # Override BIRDFY_FRAME_RATE and reload so FRAME_RATE re-reads the env; the
-    # setts tick must recompute to 90000 // rate.
+def test_setts_tick_is_rounded_not_truncated_for_fractional_rate(monkeypatch, capture_popen):
+    # A fractional BIRDFY_FRAME_RATE must produce a *rounded* tick (the whole point
+    # of recalibrating to the real ~8.6 fps): 90000/8.6 = 10465.1 -> 10465, and a
+    # rate whose tick would round *up* must not truncate. Reload so FRAME_RATE and
+    # SETTS_TICK re-read the env.
+    monkeypatch.setenv("BIRDFY_FRAME_RATE", "8.3")  # 90000/8.3 = 10843.4 -> 10843
+    mod = importlib.reload(_rtp_forwarder)
+    monkeypatch.setattr(mod.subprocess, "Popen", _FakePopen)
+    try:
+        assert mod.FRAME_RATE == 8.3
+        assert mod.SETTS_TICK == round(90000 / 8.3) == 10843
+        mod._start_ffmpeg("rtsp://localhost:8554/birdfy")
+        arg = _setts_arg(_FakePopen.last_cmd)
+        assert arg == "setts=pts=N*10843:dts=N*10843:time_base=1/90000"
+    finally:
+        # Reload again with the env cleared so other tests see the default rate.
+        monkeypatch.delenv("BIRDFY_FRAME_RATE", raising=False)
+        importlib.reload(_rtp_forwarder)
+
+
+def test_setts_tick_tracks_integer_frame_rate_override(monkeypatch, capture_popen):
+    # An integer override still works (back-compat): 30 -> round(90000/30) = 3000.
     monkeypatch.setenv("BIRDFY_FRAME_RATE", "30")
     mod = importlib.reload(_rtp_forwarder)
     monkeypatch.setattr(mod.subprocess, "Popen", _FakePopen)
@@ -75,9 +96,8 @@ def test_setts_tick_tracks_frame_rate_override(monkeypatch, capture_popen):
         mod._start_ffmpeg("rtsp://localhost:8554/birdfy")
         arg = _setts_arg(_FakePopen.last_cmd)
         assert mod.FRAME_RATE == 30
-        assert arg == "setts=pts=N*3000:dts=N*3000:time_base=1/90000"  # 90000//30
+        assert arg == "setts=pts=N*3000:dts=N*3000:time_base=1/90000"  # 90000/30
     finally:
-        # Reload again with the env cleared so other tests see the default rate.
         monkeypatch.delenv("BIRDFY_FRAME_RATE", raising=False)
         importlib.reload(_rtp_forwarder)
 

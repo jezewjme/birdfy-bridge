@@ -15,8 +15,10 @@ What it provides when a broker is configured:
                     in — no special code here beyond honoring online=0.
       - off       : pause the connect loop entirely (no WebRTC wake-pokes). The
                     camera is left alone to conserve battery.
-    The mode is read from a *retained* MQTT topic so it survives bridge restarts;
-    BIRDFY_MODE provides the first-boot default before HA has published one.
+    The chosen mode is persisted to a file in BIRDFY_STATE_DIR (.birdfy_mode) so it
+    survives a container restart, and is also echoed to a *retained* MQTT topic so
+    HA's select reflects it. The persisted file is the source of truth at boot;
+    BIRDFY_MODE only seeds the first-ever boot before that file exists.
 
   * **Sensors** published to MQTT (and auto-created in HA via MQTT Discovery):
     Battery %, Online, Awake, Charging, plus the current Mode. Battery is the
@@ -43,12 +45,50 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 
 logger = logging.getLogger("mqtt_control")
 
 # Valid modes, in the order HA's select should present them.
 MODES = ("always_on", "auto", "off")
 DEFAULT_MODE = "auto"
+
+# Where the chosen mode is persisted so it survives a container restart. Same
+# BIRDFY_STATE_DIR the auth token / UDID use (mounted as a Docker volume in
+# compose), defaulting to the home dir for parity with birdfy_api.py. The file is
+# the source of truth at boot; BIRDFY_MODE only seeds the *first-ever* boot before
+# this file exists. We resolve the dir the same way birdfy_api does so a single
+# BIRDFY_STATE_DIR covers every persisted artifact.
+try:
+    _STATE_DIR = pathlib.Path(os.getenv("BIRDFY_STATE_DIR", str(pathlib.Path.home())))
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    _STATE_DIR = pathlib.Path.home()
+_MODE_FILE = _STATE_DIR / ".birdfy_mode"
+
+
+def _read_persisted_mode() -> str | None:
+    """Return the persisted mode if a valid one was saved, else None.
+
+    Best-effort: a missing file, unreadable dir, or garbage contents all return
+    None so the caller falls back to the env default — persistence must never
+    block the bridge from starting.
+    """
+    try:
+        mode = _MODE_FILE.read_text().strip().lower()
+    except OSError:
+        return None
+    return mode if mode in MODES else None
+
+
+def _write_persisted_mode(mode: str) -> None:
+    """Persist the mode for the next restart. Best-effort (logs, never raises)."""
+    if mode not in MODES:
+        return
+    try:
+        _MODE_FILE.write_text(mode + "\n")
+    except OSError as e:  # noqa: BLE001
+        logger.warning("Could not persist mode to %s: %s", _MODE_FILE, e)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -86,7 +126,13 @@ class MqttControl:
         self._sn = serial or "unknown"
         self._device_name = device_name or "Birdfy"
         self._configured = bool(serial)
-        self._mode = config.default_mode
+        # Persisted mode (from a prior run) wins over the env default so the
+        # operator's last choice survives a container restart; BIRDFY_MODE only
+        # applies on the first-ever boot before .birdfy_mode exists.
+        persisted = _read_persisted_mode()
+        if persisted is not None:
+            logger.info("Restored persisted mode %r (env default was %r)", persisted, config.default_mode)
+        self._mode = persisted if persisted is not None else config.default_mode
         # Latest state summary to (re)publish on reconnect, so HA isn't blank
         # after a broker restart.
         self._last_state: dict = {}
@@ -260,6 +306,9 @@ class MqttControl:
             return
         if mode != self._mode:
             logger.info("MQTT: mode %s -> %s", self._mode, mode)
+            # Persist the new choice so it survives a container restart. Only on a
+            # real change to avoid rewriting the file on every retained-mode echo.
+            _write_persisted_mode(mode)
         self._mode = mode
         # Release/re-arm any live session waiting on the off event.
         if self._off_event is not None:

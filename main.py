@@ -34,8 +34,9 @@ Environment variables:
   --- Optional: media (see _rtp_forwarder.py / _aiortc_media_patches.py) ---
   BIRDFY_AUDIO         0 to disable PCMU audio passthrough (default: on; POSIX-only).
   BIRDFY_FRAME_RATE    Constant output frame rate the copied stream is stamped at
-                       (default: 9). Must match the camera's real delivered rate:
-                       a mismatch drifts video against audio (see _rtp_forwarder.py).
+                       (default: 8.6, the measured delivered rate; float OK). Must
+                       match the camera's real delivered rate: a mismatch drifts
+                       video against audio (see _rtp_forwarder.py).
   BIRDFY_JITTER_CAPACITY / BIRDFY_RTP_HISTORY_SIZE / BIRDFY_NACK_INTERVAL_MS /
   BIRDFY_NACK_MAX_RETRIES   Keyframe-recovery tunables; see _aiortc_media_patches.py.
 
@@ -46,8 +47,11 @@ Environment variables:
   MQTT_PASSWORD        Broker password (optional).
   MQTT_BASE_TOPIC      Topic prefix for state/command (default: birdfy).
   MQTT_DISCOVERY_PREFIX  HA MQTT-discovery prefix (default: homeassistant).
-  BIRDFY_MODE          First-boot mode before HA publishes one: always_on | auto |
-                       off (default: auto). HA's "Mode" select overrides at runtime.
+  BIRDFY_MODE          First-boot mode: always_on | auto | off (default: auto).
+                       HA's "Mode" select overrides at runtime, and the chosen mode
+                       is persisted (BIRDFY_STATE_DIR/.birdfy_mode) so it survives a
+                       restart — so this env only applies before that file exists.
+                       Delete the file to let a changed BIRDFY_MODE take effect again.
   BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online sensors this often
                        (default: 0 = don't poll, leave camera alone).
   BIRDFY_OFF_SENTINEL  Path to the off-mode sentinel the healthcheck honors as

@@ -12,8 +12,18 @@ import json
 
 import pytest
 
+import mqtt_control
 from birdfy_api import DeviceOfflineError, device_state_summary
 from mqtt_control import MODES, MqttConfig, MqttControl
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mode_file(monkeypatch, tmp_path):
+    """Redirect the persisted-mode file to a per-test temp path so constructing
+    MqttControl (which reads it) and _apply_mode (which writes it) never touch the
+    real BIRDFY_STATE_DIR/.birdfy_mode default or leak state between tests."""
+    monkeypatch.setattr(mqtt_control, "_MODE_FILE", tmp_path / ".birdfy_mode")
+
 
 # --- device_state_summary -------------------------------------------------
 
@@ -167,6 +177,45 @@ async def test_apply_mode_rejects_invalid_and_accepts_valid(monkeypatch):
     assert m.get_mode() == "off"
     # Echoed to the retained state topic.
     assert any("mode/state" in t and p == "off" and r for t, p, r in client.published)
+
+
+@pytest.mark.asyncio
+async def test_apply_mode_persists_to_file(monkeypatch):
+    # A real mode change must be written to the persisted-mode file so it survives
+    # a restart. The _isolate_mode_file fixture points _MODE_FILE at tmp.
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")
+    client = _FakeClient()
+    await m._apply_mode(client, b"off")
+    assert mqtt_control._read_persisted_mode() == "off"
+    assert mqtt_control._MODE_FILE.read_text().strip() == "off"
+
+
+def test_persisted_mode_wins_over_env_default(monkeypatch):
+    # A persisted file from a prior run overrides BIRDFY_MODE at construction, so
+    # the operator's last choice survives a container restart.
+    monkeypatch.setenv("BIRDFY_MODE", "auto")
+    mqtt_control._write_persisted_mode("off")
+    m = MqttControl(MqttConfig())
+    assert m.get_mode() == "off"
+
+
+def test_env_default_used_when_no_persisted_file(monkeypatch):
+    # First-ever boot (no file yet) falls back to the env default.
+    monkeypatch.setenv("BIRDFY_MODE", "always_on")
+    assert mqtt_control._read_persisted_mode() is None  # fixture tmp file absent
+    m = MqttControl(MqttConfig())
+    assert m.get_mode() == "always_on"
+
+
+def test_persisted_mode_ignores_garbage(monkeypatch):
+    # A corrupt persisted file must not crash construction and must fall back to
+    # the env default rather than adopting an invalid mode.
+    monkeypatch.setenv("BIRDFY_MODE", "auto")
+    mqtt_control._MODE_FILE.write_text("not-a-mode\n")
+    assert mqtt_control._read_persisted_mode() is None
+    m = MqttControl(MqttConfig())
+    assert m.get_mode() == "auto"
 
 
 @pytest.mark.asyncio

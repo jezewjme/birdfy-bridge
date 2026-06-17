@@ -19,7 +19,7 @@ All configuration is via environment variables (set them in `.env` for the bundl
 | `NVS_NO_TOKEN_CACHE`       | No | Set to disable token caching and always do a fresh login. |
 | `NVS_NO_TOKEN_REFRESH`     | No | Set to disable the `refreshToken`-based renewal on token expiry (falls straight back to a full login). |
 | `BIRDFY_AUDIO`             | No | `0` to disable PCMU audio passthrough (video-only). Default on. POSIX-only; auto-disables elsewhere. |
-| `BIRDFY_FRAME_RATE`        | No | Constant frame rate the copied stream is stamped at via `setts` (default: `9`, the camera's ~real delivered rate). Must match the real delivered rate: too high trips Frigate's fps-cap, and any mismatch drifts video against the audio sample clock. See [Stream timestamps](protocol.md#stream-timestamps-broken-timing--frigate-fps-cap-kill--av-drift). |
+| `BIRDFY_FRAME_RATE`        | No | Constant frame rate the copied stream is stamped at via `setts` (default: `8.6`, the measured delivered rate; fractional values OK). Must match the real delivered rate: too high trips Frigate's fps-cap, and any mismatch drifts video against the audio sample clock. See [Stream timestamps](protocol.md#stream-timestamps-broken-timing--frigate-fps-cap-kill--av-drift). |
 | `BIRDFY_JITTER_CAPACITY`   | No | aiortc video jitter buffer size, power of 2 (default: `2048`). Widened to fit large keyframes. |
 | `BIRDFY_RTP_HISTORY_SIZE`  | No | NACK missing-packet tracking window (default: `1024`). |
 | `BIRDFY_NACK_INTERVAL_MS`  | No | Periodic re-NACK interval in ms (default: `30`; `0` disables re-NACK). |
@@ -30,7 +30,7 @@ All configuration is via environment variables (set them in `.env` for the bundl
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | No | Broker credentials. Omit both for an anonymous broker. |
 | `MQTT_BASE_TOPIC`          | No | Topic prefix for state/command topics (default: `birdfy`). |
 | `MQTT_DISCOVERY_PREFIX`    | No | Home Assistant MQTT-discovery prefix (default: `homeassistant`). |
-| `BIRDFY_MODE`              | No | First-boot mode before HA publishes one: `always_on` / `auto` / `off` (default: `auto`). The HA **Mode** select overrides this at runtime. |
+| `BIRDFY_MODE`              | No | First-boot mode: `always_on` / `auto` / `off` (default: `auto`). The HA **Mode** select overrides this at runtime, and the chosen mode is persisted to `BIRDFY_STATE_DIR/.birdfy_mode` so it survives a container restart — so this env only applies before that file exists. Delete the file to let a changed `BIRDFY_MODE` take effect again. |
 | `BIRDFY_OFF_POLL_SECONDS`  | No | In `off` mode, refresh the battery/online sensors this often (default: `0` = don't poll; leave the camera alone). |
 | `BIRDFY_OFF_SENTINEL`      | No | Path to the off-mode sentinel file the bridge touches while in `off` mode (default: `/tmp/birdfy_mode_off`). The container healthcheck treats its presence as HEALTHY so it doesn't restart an intentionally-paused bridge. Must match the healthcheck's value. See [Operations](operations.md). |
 

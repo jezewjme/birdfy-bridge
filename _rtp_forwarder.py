@@ -48,7 +48,9 @@ logger = logging.getLogger(__name__)
 _START_CODE = b"\x00\x00\x00\x01"
 
 # The constant frame rate we stamp the copied stream at via `-bsf:v setts`
-# (K = 90000/FRAME_RATE), and the demuxer's fps seed (`-r`).
+# (tick = round(90000/FRAME_RATE), see SETTS_TICK), and the demuxer's fps seed.
+# A *float* on purpose — the camera's real rate is fractional (~8.6), and the
+# A/V drift below is sensitive to fractions of an fps over a long session.
 #
 # IMPORTANT — this MUST match the camera's real *delivered* rate, for two reasons:
 #   1. fps-cap teardown: too high and the output's media clock runs faster than
@@ -57,22 +59,31 @@ _START_CODE = b"\x00\x00\x00\x01"
 #   2. A/V drift: setts labels every frame exactly 1/FRAME_RATE apart, but the
 #      audio rides its true 8 kHz sample clock (≈ real time). If FRAME_RATE differs
 #      from the real delivered rate the video media clock runs fast/slow vs audio
-#      and the two drift apart over a long session (a fixed 9 against a measured
-#      8.6 ran ~4.5% fast — minutes of skew over an hour). Keeping FRAME_RATE on
-#      the real rate keeps both effects small.
+#      and the two drift apart over a long session. A fixed 9 against a measured
+#      8.6 ran ~4.5% fast — minutes of skew over an hour — which is why the default
+#      is now the measured 8.6, not an integer 9.
 # It is NOT a throttle: under -c copy ffmpeg can't resample, it only assigns
 # timestamps. (We tried -use_wallclock_as_timestamps to decouple from FRAME_RATE
 # entirely, but it stamps video at absolute epoch while audio starts at 0, and the
 # origin gap broke Frigate's reader — see _start_ffmpeg. So FRAME_RATE matters.)
 #
-# The SDP advertises 15 fps but autoBitrate delivers ~8.6–9 fps sustained (e.g.
-# 30000 frames over ~3483s ≈ 8.6 fps measured). 9 is close; if a future
-# device/firmware delivers a different sustained rate, set BIRDFY_FRAME_RATE to
-# match (confirm against the "N frames / M bytes forwarded" log: fps ≈ Δframes/Δs).
+# The SDP advertises 15 fps but autoBitrate delivers ~8.6 fps sustained (measured:
+# 30000 frames over ~3483s ≈ 8.61 fps). This is the residual-drift floor for a
+# fixed CFR — autoBitrate still wobbles second-to-second, so it can't be zero
+# without re-encoding the audio (aresample=async). If a future device/firmware
+# delivers a different sustained rate, set BIRDFY_FRAME_RATE to match it (confirm
+# against the "N frames / M bytes forwarded" log: fps ≈ Δframes / Δseconds).
 #
 # To reduce Frigate's *detection* CPU, set `detect: fps:` in the Frigate camera
 # config instead — that's a separate downstream knob and doesn't belong here.
-FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "9") or "9")
+FRAME_RATE = float(os.getenv("BIRDFY_FRAME_RATE", "8.6") or "8.6")
+
+# 90 kHz (RTP timebase) ticks per frame, fed to the setts bitstream filter as
+# pts=dts=N*SETTS_TICK. round() (not floor) so a fractional FRAME_RATE maps to the
+# nearest whole tick — e.g. 8.6 -> round(90000/8.6) = 10465. An integer division
+# would silently truncate (10465.1 -> 10465 is fine, but 90000//8.6 is a TypeError
+# on floats anyway). Frame N lands at N*SETTS_TICK/90000 s ≈ N/FRAME_RATE s.
+SETTS_TICK = round(90000 / FRAME_RATE)
 
 # Depth of the depayload->ffmpeg hand-off queue, in frames. The camera link is
 # lossy (see the re-NACK heartbeat in _aiortc_media_patches.py): aiortc's jitter
@@ -309,14 +320,15 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         # stream, starting at PTS 0, in RTP's 90 kHz timebase. This is what keeps
         # the muxer happy AND lets Frigate see a valid video stream — the video PTS
         # origin must be ~0, matching the audio's sample-clock-from-0 origin.
-        #   pts=dts=N*K, K = 90000/FRAME_RATE  → frame N at N/FRAME_RATE s
+        #   pts=dts=N*SETTS_TICK, SETTS_TICK = round(90000/FRAME_RATE)  → N/FRAME_RATE s
         # No B-frames (only SLICE/IDR NALs) so PTS==DTS. (We tried input wallclock
         # timestamps to share the audio's real clock and kill A/V drift, but that
         # stamps video at absolute epoch (~1.7e9 s) while audio starts at 0 — the
         # billion-second origin gap made Frigate's reader find "no video stream"
-        # and crash-loop. Audio drift is re-addressed on the AUDIO side below.)
+        # and crash-loop. Drift is instead bounded by matching FRAME_RATE to the
+        # camera's real delivered rate; see the FRAME_RATE note above.)
         "-bsf:v",
-        f"setts=pts=N*{90000 // FRAME_RATE}:dts=N*{90000 // FRAME_RATE}:time_base=1/90000",
+        f"setts=pts=N*{SETTS_TICK}:dts=N*{SETTS_TICK}:time_base=1/90000",
     ]
     if audio_read_fd is not None:
         # PCMU is a native RTP/RTSP payload — copy it through, no re-encode.
