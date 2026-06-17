@@ -245,3 +245,71 @@ async def test_run_retries_on_connection_failure_without_raising(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await m._run()
     assert attempts["n"] >= 3  # it kept retrying, didn't give up or raise out
+
+
+# --- _on_connect / _serve -------------------------------------------------
+
+class _Topic:
+    def __init__(self, value):
+        self.value = value
+
+    def matches(self, pattern):
+        return self.value == pattern
+
+
+class _Message:
+    def __init__(self, topic, payload):
+        self.topic = _Topic(topic)
+        self.payload = payload
+
+
+@pytest.mark.asyncio
+async def test_on_connect_announces_discovery_and_restores_state(monkeypatch):
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")
+    m._last_state = {"battery_level": 55, "online": 1}  # simulate a prior reading
+    client = _FakeClient()
+    await m._on_connect(client)
+
+    topics = [t for t, _p, _r in client.published]
+    assert m._t_avail in topics            # availability announced
+    assert m._t_mode_state in topics       # current mode published
+    assert m._t_state in topics            # last state restored
+    assert client.subscribed == [m._t_mode_set]  # subscribed to mode commands
+    # The availability payload is "online".
+    avail = [(t, p, r) for t, p, r in client.published if t == m._t_avail]
+    assert avail[0][1] == "online" and avail[0][2] is True
+
+
+@pytest.mark.asyncio
+async def test_serve_applies_incoming_mode_command(monkeypatch):
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")
+
+    class _Client(_FakeClient):
+        def __init__(self, msgs):
+            super().__init__()
+            self._msgs = msgs
+
+        @property
+        def messages(self):
+            async def _gen():
+                for msg in self._msgs:
+                    yield msg
+            return _gen()
+
+    msg = _Message(m._t_mode_set, b"off")
+    client = _Client([msg])
+    # _serve gathers a state pump (blocks on the queue) and the message handler;
+    # the handler finishes after the single message, then the pump is cancelled.
+    serve = asyncio.ensure_future(m._serve(client))
+    for _ in range(50):
+        await asyncio.sleep(0.001)
+        if m.get_mode() == "off":
+            break
+    serve.cancel()
+    try:
+        await serve
+    except asyncio.CancelledError:
+        pass
+    assert m.get_mode() == "off"  # the incoming command was applied

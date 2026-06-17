@@ -93,6 +93,11 @@ class MqttControl:
         self._state_q: asyncio.Queue = asyncio.Queue(maxsize=8)
         self._task: asyncio.Task | None = None
         self._node = f"birdfy_{self._sn}"
+        # Set whenever the current mode is `off`, cleared otherwise. Lets a live
+        # session in main() react to an off request *mid-stream* (await this
+        # event) instead of only noticing at the top of the next loop iteration.
+        # Created lazily on first access so MqttControl can be built off-loop.
+        self._off_event: asyncio.Event | None = None
 
     # ---- topic helpers ----
     @property
@@ -119,6 +124,20 @@ class MqttControl:
     def get_mode(self) -> str:
         """Current mode. Always valid; defaults to env default if no broker."""
         return self._mode
+
+    def off_event(self) -> asyncio.Event:
+        """Event that is set while mode == `off`, cleared otherwise.
+
+        A live session can `await mqtt.off_event().wait()` to be released the
+        instant the user switches to `off`, rather than running until the stream
+        happens to drop. Created on first access (needs a running loop), seeded
+        from the current mode.
+        """
+        if self._off_event is None:
+            self._off_event = asyncio.Event()
+            if self._mode == "off":
+                self._off_event.set()
+        return self._off_event
 
     def configure(self, serial: str, device_name: str = "") -> None:
         """Bind the real device serial/name and start the task (idempotent).
@@ -242,6 +261,12 @@ class MqttControl:
         if mode != self._mode:
             logger.info("MQTT: mode %s -> %s", self._mode, mode)
         self._mode = mode
+        # Release/re-arm any live session waiting on the off event.
+        if self._off_event is not None:
+            if mode == "off":
+                self._off_event.set()
+            else:
+                self._off_event.clear()
         # Echo to the state topic (retained) so HA's select reflects the change.
         await client.publish(self._t_mode_state, mode, qos=1, retain=True)
 

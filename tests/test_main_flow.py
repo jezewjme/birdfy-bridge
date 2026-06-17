@@ -68,6 +68,7 @@ class _SpyMqtt:
 
     def __init__(self):
         self.states = []
+        self._off = asyncio.Event()
 
     def configure(self, *a, **k):
         pass
@@ -77,6 +78,9 @@ class _SpyMqtt:
 
     def get_mode(self):
         return "auto"
+
+    def off_event(self):
+        return self._off
 
 
 # --- run_once offline short-circuit --------------------------------------
@@ -142,6 +146,43 @@ async def test_run_once_unknown_online_does_not_skip(monkeypatch):
     assert reached == [True]  # connected despite unknown online state
 
 
+@pytest.mark.asyncio
+async def test_run_once_off_event_tears_down_live_session(monkeypatch):
+    # A switch to `off` mid-stream must cancel a still-running connect_and_stream
+    # (the bug: off only took effect between sessions, so a long stream ignored
+    # it for an hour+). stop_live must still run on the way out.
+    _patch_common(monkeypatch, state={"online": 1, "batteryLevel": 80})
+    monkeypatch.setattr(main, "SESSION_STATE_POLL_SECONDS", 0)
+
+    cancelled = []
+    stopped = []
+
+    async def never_ending_stream(**kw):
+        try:
+            await asyncio.Event().wait()  # blocks until cancelled
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    async def fake_stop(ticket):
+        stopped.append(True)
+
+    monkeypatch.setattr(main, "connect_and_stream", never_ending_stream)
+    monkeypatch.setattr(main, "stop_live", fake_stop)
+
+    spy = _SpyMqtt()
+
+    async def flip_off_soon():
+        # Let run_once reach the wait(), then request off.
+        await asyncio.sleep(0.05)
+        spy.off_event().set()
+
+    await asyncio.gather(main.run_once(spy), flip_off_soon())
+
+    assert cancelled == [True]  # stream was torn down by the off request
+    assert stopped == [True]    # teardown still ran
+
+
 # --- poll_state_only ------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -183,6 +224,9 @@ class _ModeMqtt:
     def __init__(self, mode):
         self._mode = mode
         self.states = []
+        self._off = asyncio.Event()
+        if mode == "off":
+            self._off.set()
 
     def configure(self, *a, **k):
         pass
@@ -192,6 +236,9 @@ class _ModeMqtt:
 
     def get_mode(self):
         return self._mode
+
+    def off_event(self):
+        return self._off
 
 
 @pytest.mark.asyncio
@@ -300,3 +347,103 @@ async def test_main_short_session_walks_backoff_ladder(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await main.main()
     assert sleeps == [main.BACKOFF_SCHEDULE[0]]
+
+
+# --- session state poller + non-Addx branch -------------------------------
+
+@pytest.mark.asyncio
+async def test_publish_state_from_ticket(monkeypatch):
+    async def fake_select(ticket):
+        return {"online": 1, "awake": 1, "batteryLevel": 73}
+
+    monkeypatch.setattr(main, "select_single_device", fake_select)
+    spy = _SpyMqtt()
+    await main._publish_state_from_ticket(spy, {"_addx_sn": "SN1"})
+    assert spy.states and spy.states[0]["battery_level"] == 73
+
+
+@pytest.mark.asyncio
+async def test_session_state_poller_publishes_then_cancels(monkeypatch):
+    monkeypatch.setattr(main, "SESSION_STATE_POLL_SECONDS", 1)
+
+    published = []
+
+    async def fake_publish(mqtt, ticket):
+        published.append(ticket)
+
+    monkeypatch.setattr(main, "_publish_state_from_ticket", fake_publish)
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fast_sleep)
+
+    task = asyncio.ensure_future(main._session_state_poller(_SpyMqtt(), {"t": 1}))
+    for _ in range(50):
+        await real_sleep(0)
+        if published:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert published, "poller never refreshed state"
+
+
+@pytest.mark.asyncio
+async def test_session_poller_swallows_publish_errors(monkeypatch):
+    monkeypatch.setattr(main, "SESSION_STATE_POLL_SECONDS", 1)
+
+    calls = {"n": 0}
+
+    async def boom(mqtt, ticket):
+        calls["n"] += 1
+        raise RuntimeError("cloud hiccup")
+
+    monkeypatch.setattr(main, "_publish_state_from_ticket", boom)
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(main.asyncio, "sleep", fast_sleep)
+
+    task = asyncio.ensure_future(main._session_state_poller(_SpyMqtt(), {}))
+    for _ in range(50):
+        await real_sleep(0)
+        if calls["n"] >= 1:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The error was swallowed — the loop kept running rather than propagating.
+    assert calls["n"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_non_addx_device_raises_not_implemented(monkeypatch):
+    non_addx = {
+        "serialNumber": "SN9",
+        "deviceName": "KVS Cam",
+        "onAddx": False,
+        "region": "us-east-1",
+    }
+
+    async def fake_login(email, password):
+        return ({"userID": 1, "region": "us-east-1"}, [non_addx])
+
+    monkeypatch.setattr(main, "login_or_resume", fake_login)
+    with pytest.raises(RuntimeError, match="KVS WebRTC"):
+        await main.run_once(_SpyMqtt())
+
+
+@pytest.mark.asyncio
+async def test_run_once_no_devices_raises(monkeypatch):
+    async def fake_login(email, password):
+        return ({"userID": 1}, [])
+
+    monkeypatch.setattr(main, "login_or_resume", fake_login)
+    with pytest.raises(RuntimeError, match="No devices"):
+        await main.run_once(_SpyMqtt())

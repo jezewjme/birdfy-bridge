@@ -48,12 +48,16 @@ Environment variables:
                        off (default: auto). HA's "Mode" select overrides at runtime.
   BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online sensors this often
                        (default: 0 = don't poll, leave camera alone).
+  BIRDFY_SESSION_STATE_POLL_SECONDS  While a stream is live, re-read battery/online
+                       state this often so HA sensors don't go stale on long
+                       sessions (default: 60; 0 = only publish at session start).
 
   --- Optional overrides for NVS signing ---
   NVS_UCID             App client ID (default: 513774810c)
   NVS_UDID             Device UUID for signing (auto-generated and persisted if not set)
 """
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -213,14 +217,49 @@ async def run_once(mqtt: MqttControl | None = None):
             raise DeviceOfflineError(summary)
 
         logger.info(f"Connecting to Addx WebRTC -> RTSP output: {RTSP_OUTPUT}")
-        try:
-            await connect_and_stream(
+        # Keep HA's battery/online sensors fresh on long streams: a session can
+        # run for an hour+, and we'd otherwise publish state only once (above).
+        # This re-uses `ticket` for a passive cloud re-read on a cadence, running
+        # alongside the stream and cancelled when it ends.
+        state_poller = None
+        if mqtt is not None and SESSION_STATE_POLL_SECONDS > 0:
+            state_poller = asyncio.create_task(_session_state_poller(mqtt, ticket))
+        # Run the stream as a task so we can also watch for an `off` request that
+        # arrives *mid-session*. The main loop only re-checks mode between
+        # sessions, so without this a switch to `off` wouldn't take effect until
+        # the stream happened to drop on its own (could be an hour+). Racing the
+        # stream against mqtt.off_event() tears it down promptly instead.
+        stream_task = asyncio.create_task(
+            connect_and_stream(
                 ticket=ticket,
                 rtsp_output=RTSP_OUTPUT,
                 a4x_user_id=a4x_user_id,
                 serial_number=serial,
             )
+        )
+        waiters = [stream_task]
+        off_task = None
+        if mqtt is not None:
+            off_task = asyncio.create_task(mqtt.off_event().wait())
+            waiters.append(off_task)
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if off_task is not None and off_task.done() and not stream_task.done():
+                logger.info("Mode=off requested mid-session — tearing down stream.")
+                stream_task.cancel()
+            # Surface any stream error/result (a clean end raises nothing; a
+            # cancel from the off path is swallowed as an intentional teardown).
+            with contextlib.suppress(asyncio.CancelledError):
+                await stream_task
         finally:
+            if off_task is not None and not off_task.done():
+                off_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await off_task
+            if state_poller is not None:
+                state_poller.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await state_poller
             # Mirror the browser teardown so the cloud doesn't keep a stale
             # session pinned to our (now-dead) traceId. Best-effort.
             await stop_live(ticket)
@@ -263,6 +302,53 @@ BACKOFF_SCHEDULE = (2, 10, 30, 60, 120, 300)
 # camera battery — set this (e.g. 1200) only once you've confirmed that on a
 # healthy battery. Until then the conservative default is no poll.
 OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "0") or "0")
+
+
+# While a WebRTC session is live, re-read device state on this cadence so HA's
+# battery/online sensors don't go stale on long streams. A single uninterrupted
+# session can run for an hour+, during which we'd otherwise publish battery only
+# once (at session start) — HA then shows a frozen value. This re-uses the
+# already-issued addx ticket to call selectsingledevice, which is a passive cloud
+# read (the state the camera last reported to the cloud), so it costs no extra
+# camera wake-poke beyond the session we're already holding open. 0 disables.
+SESSION_STATE_POLL_SECONDS = int(
+    os.getenv("BIRDFY_SESSION_STATE_POLL_SECONDS", "60") or "0"
+)
+
+
+async def _publish_state_from_ticket(mqtt: MqttControl, ticket: dict) -> None:
+    """Re-read device state with an existing ticket and publish to MQTT.
+
+    Best-effort: logs and returns on any error so a transient cloud hiccup
+    never tears down the live session this runs alongside.
+    """
+    state = await select_single_device(ticket)
+    summary = device_state_summary(state)
+    mqtt.publish_state(summary)
+    batt = summary["battery_level"]
+    logger.info(
+        "[session] state poll: online=%s awake=%s battery=%s",
+        summary["online"], summary["awake"],
+        f"{batt}%" if batt is not None else "unknown",
+    )
+
+
+async def _session_state_poller(mqtt: MqttControl, ticket: dict) -> None:
+    """Periodically refresh device state for the duration of a live session.
+
+    Runs concurrently with connect_and_stream and is cancelled when the session
+    ends. The first publish happens at session start (in run_once), so this only
+    fires the *repeat* refreshes; hence we sleep before the first poll.
+    """
+    try:
+        while True:
+            await asyncio.sleep(SESSION_STATE_POLL_SECONDS)
+            try:
+                await _publish_state_from_ticket(mqtt, ticket)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[session] state poll failed: %s", e)
+    except asyncio.CancelledError:
+        raise
 
 
 async def poll_state_only(mqtt: MqttControl) -> None:
