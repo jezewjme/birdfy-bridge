@@ -12,6 +12,7 @@ Covered:
 The infinite main() loop itself (sleep/backoff timing) is not unit-tested — it's
 thin glue over these pieces; testing it would mean mocking time and is brittle.
 """
+import asyncio
 import os
 
 import pytest
@@ -166,3 +167,136 @@ async def test_poll_state_only_swallows_errors(monkeypatch):
     monkeypatch.setattr(main, "login_or_resume", boom_login)
     # Must not raise — best-effort.
     await main.poll_state_only(_SpyMqtt())
+
+
+# --- main() loop branches -------------------------------------------------
+#
+# main() is `while True`; we drive a bounded number of iterations by patching
+# asyncio.sleep to raise CancelledError after the branch under test has run, then
+# assert on what the branch did. This locks the off-mode pause and the
+# DeviceOfflineError back-off path without a real (infinite) loop.
+
+
+class _ModeMqtt:
+    """MqttControl stand-in returning a fixed mode; records publish_state."""
+
+    def __init__(self, mode):
+        self._mode = mode
+        self.states = []
+
+    def configure(self, *a, **k):
+        pass
+
+    def publish_state(self, summary):
+        self.states.append(summary)
+
+    def get_mode(self):
+        return self._mode
+
+
+@pytest.mark.asyncio
+async def test_main_off_mode_pauses_without_running_session(monkeypatch):
+    # mode=off must NOT call run_once at all — it only waits and re-checks.
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 0)  # no polling
+
+    ran = []
+
+    async def fake_run_once(mqtt):
+        ran.append(True)
+
+    monkeypatch.setattr(main, "run_once", fake_run_once)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        raise asyncio.CancelledError  # break the loop after the first off-pause
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    assert ran == []  # never opened a session
+    # Paused at the back-off cap (OFF_POLL_SECONDS=0 -> no poll cadence).
+    assert sleeps == [main.BACKOFF_SCHEDULE[-1]]
+
+
+@pytest.mark.asyncio
+async def test_main_off_mode_polls_when_configured(monkeypatch):
+    # OFF_POLL_SECONDS > 0 -> refresh sensors via poll_state_only, sleep that long.
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 1200)
+
+    polled = []
+
+    async def fake_poll(mqtt):
+        polled.append(mqtt)
+
+    monkeypatch.setattr(main, "poll_state_only", fake_poll)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    assert len(polled) == 1
+    assert sleeps == [1200]
+
+
+@pytest.mark.asyncio
+async def test_main_offline_error_backs_off_at_cap(monkeypatch):
+    # run_once raising DeviceOfflineError must route to the cap back-off and
+    # continue (not crash, not count toward the failure ladder's short-session
+    # branch).
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("auto"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+
+    async def fake_run_once(mqtt):
+        raise DeviceOfflineError({"battery_level": 4})
+
+    monkeypatch.setattr(main, "run_once", fake_run_once)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    assert sleeps == [main.BACKOFF_SCHEDULE[-1]]
+
+
+@pytest.mark.asyncio
+async def test_main_short_session_walks_backoff_ladder(monkeypatch):
+    # A clean-but-short session (< SESSION_OK_SECONDS) advances the failure
+    # ladder: the first short session sleeps BACKOFF_SCHEDULE[0].
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("auto"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+
+    async def fake_run_once(mqtt):
+        return  # returns immediately -> elapsed ~0 -> short session
+
+    monkeypatch.setattr(main, "run_once", fake_run_once)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    assert sleeps == [main.BACKOFF_SCHEDULE[0]]
