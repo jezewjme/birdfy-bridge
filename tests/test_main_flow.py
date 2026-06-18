@@ -249,6 +249,26 @@ class _ModeMqtt:
         return self._off
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 600),   # unset -> default
+        ("", 600),     # set-but-empty (blank Docker/compose option) -> default, NOT 0
+        ("   ", 600),  # whitespace-only -> default
+        ("0", 0),      # explicit 0 -> disabled (honored)
+        ("300", 300),  # explicit value
+    ],
+)
+def test_env_int_treats_empty_as_default(monkeypatch, raw, expected):
+    # Regression: the old `int(getenv(name, "600") or "0")` idiom turned a
+    # blank-but-present env var into 0, silently disabling off-mode polling.
+    if raw is None:
+        monkeypatch.delenv("BIRDFY_OFF_POLL_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("BIRDFY_OFF_POLL_SECONDS", raw)
+    assert main._env_int("BIRDFY_OFF_POLL_SECONDS", 600) == expected
+
+
 @pytest.mark.asyncio
 async def test_main_off_mode_pauses_without_running_session(monkeypatch, tmp_path):
     # mode=off must NOT call run_once at all — it only waits and re-checks.

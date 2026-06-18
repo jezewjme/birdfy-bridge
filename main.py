@@ -131,6 +131,22 @@ for _noisy in (
 
 logger = logging.getLogger("main")
 
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, treating unset *or empty* as the default.
+
+    `int(os.getenv(name, "600") or "0")` looks equivalent but isn't: a Docker
+    add-on / compose file that passes the key through with a blank value sets the
+    var to "" (not unset), so `os.getenv(name, "600")` returns "" — and `"" or
+    "0"` collapses to 0, silently disabling the feature instead of using the
+    default. Here both unset and empty fall back to `default`.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
 BIRDFY_EMAIL    = os.environ["BIRDFY_EMAIL"]
 BIRDFY_PASSWORD = os.environ["BIRDFY_PASSWORD"]
 DEVICE_ID       = os.getenv("DEVICE_ID", "")
@@ -315,7 +331,7 @@ BACKOFF_SCHEDULE = (2, 10, 30, 60, 120, 300)
 # camera last reported to the cloud — same read the live-session poller uses, see
 # SESSION_STATE_POLL_SECONDS), so polling here costs no camera wake-poke. Default
 # 600s (10 min). Set 0 to disable polling entirely and leave the last value frozen.
-OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "600") or "0")
+OFF_POLL_SECONDS = _env_int("BIRDFY_OFF_POLL_SECONDS", 600)
 
 
 # When the bridge *enters* `off` mode (e.g. the operator just flipped the HA
@@ -324,7 +340,7 @@ OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "600") or "0")
 # full OFF_POLL_SECONDS to correct them, do one poll shortly after entering off.
 # A short delay (default 15s) lets the camera's cloud state settle after a
 # just-ended session before we read it. 0 polls immediately on entry.
-OFF_POLL_INITIAL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_INITIAL_SECONDS", "15") or "0")
+OFF_POLL_INITIAL_SECONDS = _env_int("BIRDFY_OFF_POLL_INITIAL_SECONDS", 15)
 
 
 # While a WebRTC session is live, re-read device state on this cadence so HA's
@@ -334,9 +350,7 @@ OFF_POLL_INITIAL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_INITIAL_SECONDS", "15"
 # already-issued addx ticket to call selectsingledevice, which is a passive cloud
 # read (the state the camera last reported to the cloud), so it costs no extra
 # camera wake-poke beyond the session we're already holding open. 0 disables.
-SESSION_STATE_POLL_SECONDS = int(
-    os.getenv("BIRDFY_SESSION_STATE_POLL_SECONDS", "60") or "0"
-)
+SESSION_STATE_POLL_SECONDS = _env_int("BIRDFY_SESSION_STATE_POLL_SECONDS", 60)
 
 
 # Sentinel the container healthcheck watches to know the bridge is intentionally
