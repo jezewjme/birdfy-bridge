@@ -291,6 +291,9 @@ async def test_main_off_mode_polls_when_configured(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
     monkeypatch.setattr(main, "MqttConfig", lambda: object())
     monkeypatch.setattr(main, "OFF_POLL_SECONDS", 1200)
+    # Initial=0 -> poll immediately on entry (no extra settle sleep), so this test
+    # asserts only the steady-cadence sleep. The initial-delay path is covered separately.
+    monkeypatch.setattr(main, "OFF_POLL_INITIAL_SECONDS", 0)
     monkeypatch.setattr(main, "OFF_SENTINEL", str(tmp_path / "birdfy_mode_off"))
 
     polled = []
@@ -312,6 +315,37 @@ async def test_main_off_mode_polls_when_configured(monkeypatch, tmp_path):
         await main.main()
     assert len(polled) == 1
     assert sleeps == [1200]
+
+
+@pytest.mark.asyncio
+async def test_main_off_mode_initial_poll_uses_short_delay(monkeypatch, tmp_path):
+    # On *entering* off, the first pass should wait OFF_POLL_INITIAL_SECONDS, poll
+    # once to correct now-stale sensors, then sleep the steady OFF_POLL_SECONDS.
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 1200)
+    monkeypatch.setattr(main, "OFF_POLL_INITIAL_SECONDS", 15)
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(tmp_path / "birdfy_mode_off"))
+
+    events = []  # interleave sleeps and polls to assert ordering
+
+    async def fake_poll(mqtt):
+        events.append(("poll", None))
+
+    monkeypatch.setattr(main, "poll_state_only", fake_poll)
+
+    async def fake_sleep(delay):
+        events.append(("sleep", delay))
+        # Stop after the steady-cadence sleep (the 2nd sleep on the first off pass).
+        if delay == 1200:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    # Settle delay -> poll -> steady cadence.
+    assert events == [("sleep", 15), ("poll", None), ("sleep", 1200)]
 
 
 @pytest.mark.asyncio

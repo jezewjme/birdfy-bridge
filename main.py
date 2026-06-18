@@ -52,8 +52,13 @@ Environment variables:
                        is persisted (BIRDFY_STATE_DIR/.birdfy_mode) so it survives a
                        restart — so this env only applies before that file exists.
                        Delete the file to let a changed BIRDFY_MODE take effect again.
-  BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online sensors this often
-                       (default: 0 = don't poll, leave camera alone).
+  BIRDFY_OFF_POLL_SECONDS  In `off` mode, refresh battery/online/awake/charging
+                       sensors this often via a passive cloud read (default: 600 =
+                       every 10 min). Keeps HA sensors live instead of frozen at the
+                       last stream's values. Set 0 to disable and leave camera alone.
+  BIRDFY_OFF_POLL_INITIAL_SECONDS  On entering `off`, wait this long then poll once
+                       before settling into the steady cadence (default: 15), so the
+                       just-stale sensors correct promptly. Only used when polling on.
   BIRDFY_OFF_SENTINEL  Path to the off-mode sentinel the healthcheck honors as
                        HEALTHY (default: /tmp/birdfy_mode_off). Must match
                        docker/healthcheck.py.
@@ -304,13 +309,22 @@ SESSION_OK_SECONDS = 60
 BACKOFF_SCHEDULE = (2, 10, 30, 60, 120, 300)
 
 
-# In `off` mode, optionally refresh the device state (battery/online) this often
-# so the HA sensors don't go stale. 0 (default) = don't poll at all while off, so
-# `off` truly leaves the camera alone. selectsingledevice *may* be a passive
-# cloud read (state the camera last reported), in which case polling costs no
-# camera battery — set this (e.g. 1200) only once you've confirmed that on a
-# healthy battery. Until then the conservative default is no poll.
-OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "0") or "0")
+# In `off` mode, refresh the device state (battery/online/awake/charging) this
+# often so the HA sensors stay live instead of holding a stale retained value
+# from the last stream. selectsingledevice is a passive cloud read (the state the
+# camera last reported to the cloud — same read the live-session poller uses, see
+# SESSION_STATE_POLL_SECONDS), so polling here costs no camera wake-poke. Default
+# 600s (10 min). Set 0 to disable polling entirely and leave the last value frozen.
+OFF_POLL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_SECONDS", "600") or "0")
+
+
+# When the bridge *enters* `off` mode (e.g. the operator just flipped the HA
+# select to off, or stopped a stream), the previously-published online/awake
+# sensors are now stale — the camera may sleep moments later. Rather than wait a
+# full OFF_POLL_SECONDS to correct them, do one poll shortly after entering off.
+# A short delay (default 15s) lets the camera's cloud state settle after a
+# just-ended session before we read it. 0 polls immediately on entry.
+OFF_POLL_INITIAL_SECONDS = int(os.getenv("BIRDFY_OFF_POLL_INITIAL_SECONDS", "15") or "0")
 
 
 # While a WebRTC session is live, re-read device state on this cadence so HA's
@@ -425,6 +439,10 @@ async def main():
     # the task with the correct serial bound.
 
     consecutive_failures = 0
+    # Tracks whether the previous loop iteration was already in `off` mode, so the
+    # first pass after *entering* off can do a prompt initial poll (correcting the
+    # now-stale online/awake sensors) instead of waiting a full OFF_POLL_SECONDS.
+    was_off = False
     # Each loop here is one camera session. The Birdfy's cloud WebRTC session
     # drops every few minutes (camera sleep/wake), so re-publishing the RTSP
     # output is normal, not an error. Downstream impact operators hit:
@@ -447,14 +465,28 @@ async def main():
         if mqtt.get_mode() == "off":
             _set_off_sentinel(True)
             if OFF_POLL_SECONDS > 0:
+                # On the *first* pass after entering off, the published
+                # online/awake/charging values are stale (left over from the last
+                # stream) and the camera may go dormant any moment — so poll soon
+                # after a short settle delay rather than waiting the full cadence.
+                # Steady-state passes just poll on the OFF_POLL_SECONDS cadence.
+                if not was_off and OFF_POLL_INITIAL_SECONDS > 0:
+                    await asyncio.sleep(OFF_POLL_INITIAL_SECONDS)
                 await poll_state_only(mqtt)
-            delay = OFF_POLL_SECONDS if OFF_POLL_SECONDS > 0 else BACKOFF_SCHEDULE[-1]
+                delay = OFF_POLL_SECONDS
+            else:
+                # Polling disabled: leave the camera fully alone; sensors hold
+                # their last value. Re-check the mode at the back-off cap.
+                delay = BACKOFF_SCHEDULE[-1]
+            was_off = True
             logger.info("Mode=off — bridge paused, re-checking mode in %ss ...", delay)
             await asyncio.sleep(delay)
             continue
         # Not off (or just left off): clear the sentinel so a genuinely stuck
-        # stream can still go unhealthy.
+        # stream can still go unhealthy, and reset the off-entry tracker so the
+        # next switch into off triggers a fresh prompt poll.
         _set_off_sentinel(False)
+        was_off = False
 
         t_start = time.monotonic()
         try:
