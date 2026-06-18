@@ -274,7 +274,8 @@ async def test_main_off_mode_pauses_without_running_session(monkeypatch, tmp_pat
     # mode=off must NOT call run_once at all — it only waits and re-checks.
     monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
     monkeypatch.setattr(main, "MqttConfig", lambda: object())
-    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 0)  # no polling
+    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 0)  # cadence polling disabled
+    monkeypatch.setattr(main, "OFF_POLL_INITIAL_SECONDS", 0)
     # Point the off sentinel at a temp file so we can assert the healthcheck hint
     # is written while paused (its presence keeps the container HEALTHY in off mode).
     sentinel = tmp_path / "birdfy_mode_off"
@@ -287,6 +288,14 @@ async def test_main_off_mode_pauses_without_running_session(monkeypatch, tmp_pat
 
     monkeypatch.setattr(main, "run_once", fake_run_once)
 
+    polled = []
+
+    async def fake_poll(mqtt):
+        polled.append(mqtt)
+        return True  # published -> entry handled
+
+    monkeypatch.setattr(main, "poll_state_only", fake_poll)
+
     sleeps = []
 
     async def fake_sleep(delay):
@@ -298,7 +307,10 @@ async def test_main_off_mode_pauses_without_running_session(monkeypatch, tmp_pat
     with pytest.raises(asyncio.CancelledError):
         await main.main()
     assert ran == []  # never opened a session
-    # Paused at the back-off cap (OFF_POLL_SECONDS=0 -> no poll cadence).
+    # Even with cadence polling disabled, the *entry* poll still runs once so
+    # MQTT discovery/availability come up and HA isn't left showing `unavailable`.
+    assert len(polled) == 1
+    # Then paused at the back-off cap (OFF_POLL_SECONDS=0 -> no poll cadence).
     assert sleeps == [main.BACKOFF_SCHEDULE[-1]]
     # Off sentinel was created so the healthcheck treats not-publishing as
     # intentional rather than restarting the container.
@@ -320,6 +332,7 @@ async def test_main_off_mode_polls_when_configured(monkeypatch, tmp_path):
 
     async def fake_poll(mqtt):
         polled.append(mqtt)
+        return True
 
     monkeypatch.setattr(main, "poll_state_only", fake_poll)
 
@@ -351,6 +364,7 @@ async def test_main_off_mode_initial_poll_uses_short_delay(monkeypatch, tmp_path
 
     async def fake_poll(mqtt):
         events.append(("poll", None))
+        return True
 
     monkeypatch.setattr(main, "poll_state_only", fake_poll)
 
@@ -366,6 +380,46 @@ async def test_main_off_mode_initial_poll_uses_short_delay(monkeypatch, tmp_path
         await main.main()
     # Settle delay -> poll -> steady cadence.
     assert events == [("sleep", 15), ("poll", None), ("sleep", 1200)]
+
+
+@pytest.mark.asyncio
+async def test_main_off_mode_entry_poll_retries_on_failure(monkeypatch, tmp_path):
+    # If the entry poll can't publish (boot-time cloud/network hiccup), the loop
+    # must NOT latch as handled — otherwise HA stays `unavailable` forever when
+    # cadence polling is disabled. It should back off briefly and retry the entry
+    # poll, then latch once it succeeds.
+    monkeypatch.setattr(main, "MqttControl", lambda cfg: _ModeMqtt("off"))
+    monkeypatch.setattr(main, "MqttConfig", lambda: object())
+    monkeypatch.setattr(main, "OFF_POLL_SECONDS", 0)  # cadence disabled
+    monkeypatch.setattr(main, "OFF_POLL_INITIAL_SECONDS", 0)
+    monkeypatch.setattr(main, "OFF_SENTINEL", str(tmp_path / "birdfy_mode_off"))
+
+    results = iter([False, True])  # first poll fails, second succeeds
+
+    polls = []
+
+    async def fake_poll(mqtt):
+        ok = next(results)
+        polls.append(ok)
+        return ok
+
+    monkeypatch.setattr(main, "poll_state_only", fake_poll)
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        # Break after the steady-state cap sleep that follows a successful entry.
+        if delay == main.BACKOFF_SCHEDULE[-1]:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main.main()
+    # Failed poll -> short retry back-off; successful poll -> settle at the cap.
+    assert polls == [False, True]
+    assert sleeps == [main.BACKOFF_SCHEDULE[0], main.BACKOFF_SCHEDULE[-1]]
 
 
 @pytest.mark.asyncio

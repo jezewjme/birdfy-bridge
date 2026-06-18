@@ -413,18 +413,21 @@ async def _session_state_poller(mqtt: MqttControl, ticket: dict) -> None:
         raise
 
 
-async def poll_state_only(mqtt: MqttControl) -> None:
+async def poll_state_only(mqtt: MqttControl) -> bool:
     """Fetch device state without opening a WebRTC session, publish to MQTT.
 
     Used in `off` mode to keep HA's battery/online sensors fresh (when
-    BIRDFY_OFF_POLL_SECONDS > 0) without the wake-poke of a full handshake.
-    Best-effort: logs and returns on any error.
+    BIRDFY_OFF_POLL_SECONDS > 0) without the wake-poke of a full handshake, and
+    once on entry to off so MQTT discovery/availability come up.
+
+    Returns True if it got far enough to publish state (so the caller knows HA is
+    now populated). Best-effort: logs and returns False on any error.
     """
     try:
         auth_data, devices = await login_or_resume(BIRDFY_EMAIL, BIRDFY_PASSWORD)
         target = _pick_device(devices)
         if target is None or not target.get("onAddx"):
-            return
+            return False
         mqtt.configure(str(target["serialNumber"]), target.get("deviceName") or "Birdfy")
         device_region = target.get("region") or auth_data.get("region")
         ticket = await get_addx_ticket(auth_data, device=target, device_region=device_region)
@@ -436,8 +439,10 @@ async def poll_state_only(mqtt: MqttControl) -> None:
             "[off] state poll: online=%s battery=%s",
             summary["online"], f"{batt}%" if batt is not None else "unknown",
         )
+        return True
     except Exception as e:  # noqa: BLE001
         logger.warning("[off] state poll failed: %s", e)
+        return False
 
 
 async def main():
@@ -478,21 +483,39 @@ async def main():
         # and doesn't restart us (see _set_off_sentinel).
         if mqtt.get_mode() == "off":
             _set_off_sentinel(True)
-            if OFF_POLL_SECONDS > 0:
-                # On the *first* pass after entering off, the published
-                # online/awake/charging values are stale (left over from the last
-                # stream) and the camera may go dormant any moment — so poll soon
-                # after a short settle delay rather than waiting the full cadence.
-                # Steady-state passes just poll on the OFF_POLL_SECONDS cadence.
-                if not was_off and OFF_POLL_INITIAL_SECONDS > 0:
+            # The MQTT task (HA discovery + availability=online + retained state)
+            # is only started by configure(), which is only reached via a device
+            # fetch (poll_state_only / run_once). So on a *fresh boot straight into
+            # off mode*, nothing has published discovery yet and HA shows every
+            # entity as `unavailable`. Do one poll on first entry regardless of the
+            # poll cadence so MQTT comes up with real state; it costs a single
+            # passive cloud read (no camera wake-poke).
+            if not was_off:
+                # On entry the previously-published online/awake/charging values
+                # are stale (left over from the last stream) and the camera may go
+                # dormant any moment, so correct them promptly after a short settle
+                # delay rather than waiting a full cadence.
+                if OFF_POLL_INITIAL_SECONDS > 0:
                     await asyncio.sleep(OFF_POLL_INITIAL_SECONDS)
+                # Only latch "entry handled" once the poll actually published — so a
+                # boot-time cloud/network hiccup (which would otherwise leave HA at
+                # `unavailable` with discovery never sent) retries on the next pass
+                # instead of latching into a blank steady state.
+                if await poll_state_only(mqtt):
+                    was_off = True
+                else:
+                    delay = BACKOFF_SCHEDULE[0]
+                    logger.info(
+                        "Mode=off — entry poll failed, retrying in %ss ...", delay
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            elif OFF_POLL_SECONDS > 0:
+                # Steady-state passes just refresh on the OFF_POLL_SECONDS cadence.
                 await poll_state_only(mqtt)
-                delay = OFF_POLL_SECONDS
-            else:
-                # Polling disabled: leave the camera fully alone; sensors hold
-                # their last value. Re-check the mode at the back-off cap.
-                delay = BACKOFF_SCHEDULE[-1]
-            was_off = True
+            # Cadence: poll interval when enabled, else re-check the mode at the
+            # back-off cap (camera left fully alone; sensors hold their last value).
+            delay = OFF_POLL_SECONDS if OFF_POLL_SECONDS > 0 else BACKOFF_SCHEDULE[-1]
             logger.info("Mode=off — bridge paused, re-checking mode in %ss ...", delay)
             await asyncio.sleep(delay)
             continue
