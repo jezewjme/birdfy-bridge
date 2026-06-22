@@ -3,11 +3,27 @@
 # and serves reads to anything on the container network (VLC, Frigate, etc.).
 # No auth — homelab use. Lock down with publishUser/publishPass if exposing wider.
 
-logLevel: info
+# `warn`, not `info`: at info MediaMTX logs every RTSP reader open/close and a
+# "no stream is available on path 'birdfy'" line for each Frigate reconnect
+# attempt while the camera is between sessions or in `off` mode — many lines per
+# second of pure churn. warn keeps real problems (publisher drops, errors) while
+# dropping that routine reader noise. The bridge's own Python logs (connect,
+# battery, forwarder frame counts) are separate and unaffected. To get the
+# per-session reader/publish trace back for debugging, set this to info.
+logLevel: warn
 logDestinations: [stdout]
 
 rtspAddress: :8554
 rtspTransports: [tcp, udp]
+
+# Publisher/reader socket timeouts. Default is 10s; the in-container ffmpeg
+# remux (-c copy) occasionally falls slightly behind realtime and goes briefly
+# silent, which tripped the 10s read timeout and dropped the publisher — kicking
+# off a reconnect/restart cascade. 30s tolerates a transient ffmpeg hiccup
+# without flapping the path. (The real fix is the non-blocking stdin write in
+# _rtp_forwarder.py; this is defense in depth.)
+readTimeout: 30s
+writeTimeout: 30s
 
 # Control API — used ONLY by the container healthcheck to ask whether the
 # 'birdfy' path is actively publishing (ready:true). Bound to localhost so it is

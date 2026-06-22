@@ -23,6 +23,8 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from aiortc.jitterbuffer import JitterBuffer, JitterFrame
 
@@ -45,10 +47,55 @@ logger = logging.getLogger(__name__)
 # H264 Annex B start code. h264_depayload always emits 4-byte start codes.
 _START_CODE = b"\x00\x00\x00\x01"
 
-# The camera's negotiated frame rate (confirmed in ffmpeg's input probe: "15 fps").
-# We feed ffmpeg as constant-rate at this value so output timestamps are clean and
-# Frigate's fps-cap watchdog doesn't tear the stream down. Override via env.
-FRAME_RATE = int(os.getenv("BIRDFY_FRAME_RATE", "15"))
+# The constant frame rate we stamp the copied stream at via `-bsf:v setts`
+# (tick = round(90000/FRAME_RATE), see SETTS_TICK), and the demuxer's fps seed.
+# A *float* on purpose — the camera's real rate is fractional (~8.6), and the
+# A/V drift below is sensitive to fractions of an fps over a long session.
+#
+# IMPORTANT — this MUST match the camera's real *delivered* rate, for two reasons:
+#   1. fps-cap teardown: too high and the output's media clock runs faster than
+#      wall-clock, tripping Frigate's fps-cap watchdog (go2rtc "error=EOF" churn,
+#      "exceeded fps limit" kills).
+#   2. A/V drift: setts labels every frame exactly 1/FRAME_RATE apart, but the
+#      audio rides its true 8 kHz sample clock (≈ real time). If FRAME_RATE differs
+#      from the real delivered rate the video media clock runs fast/slow vs audio
+#      and the two drift apart over a long session. A fixed 9 against a measured
+#      8.6 ran ~4.5% fast — minutes of skew over an hour — which is why the default
+#      is now the measured 8.6, not an integer 9.
+# It is NOT a throttle: under -c copy ffmpeg can't resample, it only assigns
+# timestamps. (We tried -use_wallclock_as_timestamps to decouple from FRAME_RATE
+# entirely, but it stamps video at absolute epoch while audio starts at 0, and the
+# origin gap broke Frigate's reader — see _start_ffmpeg. So FRAME_RATE matters.)
+#
+# The SDP advertises 15 fps but autoBitrate delivers ~8.6 fps sustained (measured:
+# 30000 frames over ~3483s ≈ 8.61 fps). This is the residual-drift floor for a
+# fixed CFR — autoBitrate still wobbles second-to-second, so it can't be zero
+# without re-encoding the audio (aresample=async). If a future device/firmware
+# delivers a different sustained rate, set BIRDFY_FRAME_RATE to match it (confirm
+# against the "N frames / M bytes forwarded" log: fps ≈ Δframes / Δseconds).
+#
+# To reduce Frigate's *detection* CPU, set `detect: fps:` in the Frigate camera
+# config instead — that's a separate downstream knob and doesn't belong here.
+FRAME_RATE = float(os.getenv("BIRDFY_FRAME_RATE", "8.6") or "8.6")
+
+# 90 kHz (RTP timebase) ticks per frame, fed to the setts bitstream filter as
+# pts=dts=N*SETTS_TICK. round() (not floor) so a fractional FRAME_RATE maps to the
+# nearest whole tick — e.g. 8.6 -> round(90000/8.6) = 10465. An integer division
+# would silently truncate (10465.1 -> 10465 is fine, but 90000//8.6 is a TypeError
+# on floats anyway). Frame N lands at N*SETTS_TICK/90000 s ≈ N/FRAME_RATE s.
+SETTS_TICK = round(90000 / FRAME_RATE)
+
+# Depth of the depayload->ffmpeg hand-off queue, in frames. The camera link is
+# lossy (see the re-NACK heartbeat in _aiortc_media_patches.py): aiortc's jitter
+# buffer stalls waiting on a retransmit, then releases a *burst* of held frames at
+# once. The consumer hands each frame to ffmpeg via a blocking stdin write, so a
+# burst transiently backs up the pipe and the queue must be deep enough to ride
+# that out — otherwise it overflows and we drop frames mid-GOP (a few-second skip
+# in Frigate). NOTE: sustained (not bursty) overflow means ffmpeg itself is
+# stalled, not that this is too small — that was the unset-PTS muxer stall, fixed
+# by the setts filter (see _start_ffmpeg); don't paper over a recurrence by just
+# raising this. At ~9 fps, 512 frames ≈ 57s of slack. Override via env if needed.
+QUEUE_MAXSIZE = int(os.getenv("BIRDFY_FORWARD_QUEUE", "512") or "512")
 
 # Where ffmpeg's stderr is written. We tail this into the main log on exit so
 # ffmpeg's own diagnosis ("non-existing PPS", "Invalid data", etc.) is visible
@@ -91,6 +138,20 @@ BIG_FRAME_BYTES = 12000
 MAX_GARBAGE_DUMPS = 3
 
 
+class _LazyHex:
+    """Hex-dump the first 16 bytes of a frame, but only if the log record is
+    actually emitted. Passed as a %s arg so the (per-keyframe) formatting cost
+    is skipped when the level is filtered out."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __str__(self) -> str:
+        return self._data[:16].hex(" ")
+
+
 def _iter_nals(data: bytes):
     """Yield (nal_type, nal_bytes_with_start_code) for each NAL in Annex B data.
 
@@ -98,24 +159,17 @@ def _iter_nals(data: bytes):
     don't need to handle 3-byte variants. If a malformed frame ever shows up
     without start codes, we yield nothing — caller treats as "no SPS/PPS seen".
     """
-    pos = 0
-    n = len(data)
-    # Find the first start code
-    while pos < n - 3:
-        if data[pos:pos + 4] == _START_CODE:
-            break
-        pos += 1
-    else:
+    # bytes.find() scans for the start code in C — far cheaper than a Python
+    # byte-by-byte loop on a 12KB+ keyframe, which runs on the receive path.
+    pos = data.find(_START_CODE)
+    if pos < 0:
         return
 
+    n = len(data)
     while pos < n:
         # We're sitting on a start code. Find the next one.
-        end = pos + 4
-        while end < n - 3:
-            if data[end:end + 4] == _START_CODE:
-                break
-            end += 1
-        else:
+        end = data.find(_START_CODE, pos + 4)
+        if end < 0:
             end = n
 
         nal = data[pos:end]
@@ -198,32 +252,49 @@ def _unwrap_jitter_buffer(receiver) -> None:
 def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subprocess.Popen:
     """Start ffmpeg in H264-passthrough mode writing to RTSP.
 
-    Timestamps: the raw Annex B stream we feed in has no container timing. We
-    previously used -use_wallclock_as_timestamps, but stamping at *arrival* wall
-    time is wrong here — NACK-recovered and reordered frames arrive out of order,
-    so wall-clock DTS goes backwards. ffmpeg then logs "Non-monotonous DTS" and
-    emits a ~30fps-looking jittery stream, which trips Frigate's fps-cap watchdog
-    and tears the whole RTSP path down (404 cascade). Instead we declare the
-    input as constant FRAME_RATE fps H264 (-r before -i) and let ffmpeg generate
-    clean monotonic PTS/DTS at that rate (-fflags +genpts, -fps_mode cfr). The
-    camera's negotiated stream is 15 fps (confirmed in ffmpeg input probe).
+    Timestamps — the raw Annex B stream we feed in has no container timing, so we
+    must synthesize it. Approaches tried and why we landed on `setts`:
+      * -fflags +genpts / -fps_mode cfr cannot stamp a *copied* raw stream: they
+        dup/drop against input timestamps, and raw Annex B under -c copy has none.
+        Packets reached the RTSP muxer with unset PTS, ffmpeg 5.1 logged
+        "Timestamps are unset in a packet", and the muxer stalled to speed≈0.2x —
+        backpressuring stdin so our hand-off queue overflowed (multi-second skips).
+      * -use_wallclock_as_timestamps 1 stamps video at *absolute epoch* (~1.7e9 s
+        in 90 kHz units) while audio starts at ~0 (its µ-law sample count). That
+        billion-second origin gap between the two tracks made downstream readers
+        (Frigate's ffmpeg) find "Output file does not contain any stream" / "no
+        video stream" and crash-loop. Rejected — the video PTS origin MUST be ~0 to
+        match audio's sample-clock-from-0 origin.
+
+    Current: -bsf:v setts assigns constant-rate, strictly-monotonic timestamps on
+    the copied stream starting at PTS 0, in RTP's native 90 kHz timebase
+    (setts=pts=N*K:dts=N*K:time_base=1/90000, K = 90000/FRAME_RATE). Frame N is at
+    N/FRAME_RATE s — monotonic regardless of arrival order, no decode, and crucially
+    origin-0 so audio and video line up at the start. The camera has no B-frames
+    (only SLICE/IDR NALs) so PTS==DTS.
+
+    Caveat (A/V drift): a fixed CFR labels every frame 1/FRAME_RATE apart, while
+    audio rides its true 8 kHz sample clock. If FRAME_RATE != the camera's real
+    delivered rate (~8.6 fps measured, autoBitrate-driven), the video media clock
+    runs fast/slow vs audio and the two drift apart over a long session. The fix is
+    to keep FRAME_RATE close to the real delivered rate (see the FRAME_RATE note) —
+    the residual second-to-second wobble is small and bounded.
 
     -c copy: no re-encode (the whole point of this path).
 
     audio_read_fd: if given, ffmpeg reads raw PCMU (µ-law) audio from this fd as a
     second input (pipe:<fd>) and copies it into the RTSP output (-c:a copy). The
-    fd is inherited by the child via Popen(pass_fds=...). We let ffmpeg derive the
-    audio PTS from the sample clock (-f mulaw -ar 8000): that is naturally
-    monotonic and starts at 0, matching the video's genpts-from-0, so the two
-    inputs stay roughly aligned without a separate wall-clock. Passing None keeps
-    the original video-only behavior byte-for-byte.
+    fd is inherited by the child via Popen(pass_fds=...). ffmpeg derives the audio
+    PTS from the sample clock (-f mulaw -ar 8000), starting at 0 — matching the
+    setts video origin so the two inputs start aligned. Passing None keeps the
+    original video-only behavior.
     """
     cmd = [
         "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        # Treat the headerless H264 we pipe in as constant FRAME_RATE fps so
-        # ffmpeg assigns evenly-spaced, monotonic timestamps regardless of how
-        # jittery our frame delivery is.
+        # Seed the raw-H264 demuxer's fps guess. Under `-f h264` + `-c copy` this
+        # does not itself stamp packets (raw Annex B carries no timing, copy bypasses
+        # rate filters) — the `-bsf:v setts` below assigns the actual CFR timestamps.
+        # This just keeps the demuxer's initial guess sane.
         "-r", str(FRAME_RATE),
     ]
     if audio_read_fd is not None:
@@ -252,10 +323,19 @@ def _start_ffmpeg(rtsp_output: str, audio_read_fd: int | None = None) -> subproc
         ]
     cmd += [
         "-c:v", "copy",
-        # Constant frame rate output: pad/drop to keep DTS strictly monotonic so
-        # downstream (Frigate) sees a stable rate and doesn't fps-cap-kill us.
-        "-fps_mode", "cfr",
-        "-r", str(FRAME_RATE),
+        # Assign constant-rate, strictly-monotonic timestamps on the copied H264
+        # stream, starting at PTS 0, in RTP's 90 kHz timebase. This is what keeps
+        # the muxer happy AND lets Frigate see a valid video stream — the video PTS
+        # origin must be ~0, matching the audio's sample-clock-from-0 origin.
+        #   pts=dts=N*SETTS_TICK, SETTS_TICK = round(90000/FRAME_RATE)  → N/FRAME_RATE s
+        # No B-frames (only SLICE/IDR NALs) so PTS==DTS. (We tried input wallclock
+        # timestamps to share the audio's real clock and kill A/V drift, but that
+        # stamps video at absolute epoch (~1.7e9 s) while audio starts at 0 — the
+        # billion-second origin gap made Frigate's reader find "no video stream"
+        # and crash-loop. Drift is instead bounded by matching FRAME_RATE to the
+        # camera's real delivered rate; see the FRAME_RATE note above.)
+        "-bsf:v",
+        f"setts=pts=N*{SETTS_TICK}:dts=N*{SETTS_TICK}:time_base=1/90000",
     ]
     if audio_read_fd is not None:
         # PCMU is a native RTP/RTSP payload — copy it through, no re-encode.
@@ -388,7 +468,11 @@ async def forward_video(
     via a second ffmpeg input (-c:a copy). The video path is unchanged when no
     audio receiver is supplied or audio is disabled.
     """
-    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=256)
+    queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+    # Rate-limit the "queue full" warning: a burst overflow would otherwise emit
+    # hundreds of identical lines per second. We coalesce into one WARNING every
+    # ~2s carrying the running drop count so the signal survives without the spam.
+    drop_state = {"count": 0, "last_log": 0.0}
 
     def _on_frame(jf: JitterFrame) -> None:
         # Called synchronously from _handle_rtp_packet on the receive loop.
@@ -398,7 +482,16 @@ async def forward_video(
         try:
             queue.put_nowait(jf.data)
         except asyncio.QueueFull:
-            logger.warning("RTP forwarder queue full — dropping frame")
+            drop_state["count"] += 1
+            now = time.monotonic()
+            if now - drop_state["last_log"] >= 2.0:
+                logger.warning(
+                    "RTP forwarder queue full — dropping frames (%d dropped total, "
+                    "depth=%d). Link is bursty; raise BIRDFY_FORWARD_QUEUE if frequent.",
+                    drop_state["count"],
+                    QUEUE_MAXSIZE,
+                )
+                drop_state["last_log"] = now
 
     _wrap_jitter_buffer(receiver, _on_frame)
 
@@ -454,6 +547,16 @@ async def forward_video(
         pump.start_writer()
         return p, pump
 
+    loop = asyncio.get_event_loop()
+    # Dedicated single thread for ffmpeg stdin writes. proc.stdin.write blocks
+    # when ffmpeg's input pipe is full (it paces output at CFR, so a burst of
+    # held frames backs the pipe up). On the *shared* default executor that
+    # blocking call competes with the audio pump and every other run_in_executor
+    # caller — a stalled video write could starve audio (and vice versa), and a
+    # busy pool delays the next write, deepening the queue backlog. A private
+    # one-thread pool guarantees video writes are serialized only against
+    # themselves and start the instant the previous one returns.
+    write_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ffmpeg-stdin")
     proc: subprocess.Popen | None = None
     params = _ParamSetCache()
     pre_proc_frames_dropped = 0
@@ -500,11 +603,10 @@ async def forward_video(
             # Debug: log the first few frames' shape so we can see what aiortc
             # actually hands us (start-code layout, NAL types observed).
             if pre_proc_frames_dropped < 5 and proc is None:
-                head = data[:16].hex(" ")
                 logger.info(
                     "RTP forwarder: frame %d bytes head=%s start_code=%s nal_types=%s",
                     len(data),
-                    head,
+                    _LazyHex(data),
                     has_start_code,
                     nal_types,
                 )
@@ -515,14 +617,13 @@ async def forward_video(
             # is the failure we care about. Either way include the running tally
             # so a debug session can see whether keyframes stay clean.
             if len(data) >= BIG_FRAME_BYTES:
-                head = data[:16].hex(" ")
                 _level = logging.WARNING if is_garbage else logging.DEBUG
                 logger.log(
                     _level,
                     "RTP forwarder: BIG frame %d bytes head=%s start_code=%s "
                     "nal_types=%s garbage=%s (tally: frames=%d garbage=%d idr=%d)",
                     len(data),
-                    head,
+                    _LazyHex(data),
                     has_start_code,
                     nal_types,
                     is_garbage,
@@ -611,7 +712,15 @@ async def forward_video(
                 out = data
 
             try:
-                proc.stdin.write(out)  # type: ignore[union-attr]
+                # Blocking write — offload to our dedicated single-thread pool so
+                # a momentarily-stalled ffmpeg (full stdin pipe) can't freeze the
+                # event loop. If the loop blocks here, the RTP receive loop, audio
+                # pump, and WS heartbeat all stall, the RTSP publish goes silent,
+                # and MediaMTX times out the publisher (the ~7-min reconnect/restart
+                # cascade seen after the aiortc/av bumps changed frame pacing).
+                # write_pool (not the shared default executor) keeps these writes
+                # off the pool the audio pump and other tasks share.
+                await loop.run_in_executor(write_pool, proc.stdin.write, out)  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("RTP forwarder: ffmpeg pipe broken — will restart on next keyframe")
                 _log_ffmpeg_tail()
@@ -636,7 +745,8 @@ async def forward_video(
         logger.info(
             "RTP forwarder summary: frames_seen=%d garbage(no-start-code)=%d "
             "garbage_skipped=%d idr_total=%d frames_forwarded=%d bytes_forwarded=%d "
-            "ffmpeg_restarts=%d audio_frames=%d audio_enabled=%s ffmpeg_started=%s",
+            "ffmpeg_restarts=%d queue_drops=%d audio_frames=%d audio_enabled=%s "
+            "ffmpeg_started=%s",
             total_frames_seen,
             garbage_frames_seen,
             garbage_frames_skipped,
@@ -644,6 +754,7 @@ async def forward_video(
             frames_in,
             bytes_in,
             ffmpeg_restarts,
+            drop_state["count"],
             audio_frames_seen,
             audio_enabled,
             proc is not None,
@@ -653,13 +764,7 @@ async def forward_video(
         _unwrap_jitter_buffer(receiver)
         if audio_enabled:
             _unwrap_jitter_buffer(audio_receiver)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.stdin.close()  # type: ignore[union-attr]
-            except Exception:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _reap_ffmpeg(proc)
+        # Tear down the dedicated writer thread. ffmpeg's stdin is closed above,
+        # so any in-flight write has unblocked; don't wait on a wedged write.
+        write_pool.shutdown(wait=False)

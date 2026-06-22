@@ -40,7 +40,7 @@ The codebase prefers terse, technical writing in both code and prose. Comments s
 
 ## Protocol reverse-engineering
 
-The wire protocol notes in [`README.md`](README.md) and [`birdfy_api.py`](birdfy_api.py) were derived by:
+The wire protocol notes in [`docs/protocol.md`](docs/protocol.md) and [`birdfy_api.py`](birdfy_api.py) were derived by:
 
 1. Logging into `my.birdfy.com` in Edge / Chrome and saving the network HAR.
 2. Capturing the post-DTLS traffic with Wireshark to confirm SCTP / DTLS behavior.

@@ -119,6 +119,21 @@ class RefreshFailedError(RuntimeError):
     """
 
 
+class DeviceOfflineError(RuntimeError):
+    """Raised when the camera reports online=0 before a stream attempt.
+
+    Lets the main loop skip the (futile) WebRTC handshake and back off without
+    burning wake-pokes against a sleeping/offline battery cam. Carries the
+    parsed state summary so the caller can log battery level etc.
+    """
+
+    def __init__(self, summary: dict):
+        self.summary = summary
+        batt = summary.get("battery_level")
+        batt_str = f"{batt}%" if batt is not None else "unknown"
+        super().__init__(f"camera offline (battery {batt_str})")
+
+
 def _load_cached_auth() -> dict | None:
     """Return the cached auth dict if present and parseable, else None."""
     if os.getenv("NVS_NO_TOKEN_CACHE"):
@@ -696,7 +711,7 @@ async def get_addx_ticket(
         return ticket
 
 
-async def select_single_device(ticket: dict) -> bool:
+async def select_single_device(ticket: dict) -> dict | None:
     """
     POST {endpoint}device/selectsingledevice — first call the browser makes
     after addx-token/before getWebrtcTicket. Appears to "wake" the camera's
@@ -705,7 +720,11 @@ async def select_single_device(ticket: dict) -> bool:
     Pulls endpoint/token/serial/language from the ticket dict (or any compatible
     state dict with the _addx_* keys).
 
-    Returns True if cloud returned 200, False otherwise (best-effort: never raises).
+    Returns the cloud's `data` dict on HTTP 200 (a truthy mapping carrying live
+    device state — `online`, `awake`, `batteryLevel`, `isCharging`, etc.), or
+    None on any failure. Best-effort: never raises. The truthy/falsy contract is
+    preserved for callers that only checked success, while callers that want
+    device state can read fields off the returned dict (see device_state_summary).
     """
     endpoint = ticket["_addx_endpoint"]
     addx_token = ticket["_addx_token"]
@@ -742,12 +761,48 @@ async def select_single_device(ticket: dict) -> bool:
                     logger.warning(
                         f"selectsingledevice HTTP {resp.status}: {_redact_response(text, limit=200)}"
                     )
-                    return False
+                    return None
                 logger.info("selectsingledevice OK")
-                return True
+                try:
+                    data = json.loads(text).get("data")
+                except (ValueError, AttributeError):
+                    data = None
+                # Return at least an empty dict so the call still reads as
+                # "succeeded" (truthy) even if the body shape is unexpected.
+                return data if isinstance(data, dict) else {}
     except Exception as e:
         logger.warning(f"selectsingledevice call failed: {e}")
-        return False
+        return None
+
+
+def device_state_summary(state: dict | None) -> dict:
+    """Extract the live device-state fields we care about from a
+    selectsingledevice `data` dict, with safe defaults.
+
+    Field meanings (confirmed against a live Birdfy Feeder Bamboo):
+      online       1 = camera reachable by cloud, 0 = offline (asleep/dead).
+      awake        1 = actively awake, 0 = dormant (battery cams sleep often).
+      batteryLevel battery charge percent (0-100). 1 means nearly dead.
+      isCharging   1 = charging (solar/USB), 0 = on battery.
+      offlineTime  cloud timestamp of when it went offline (may be absent).
+    Unknown/missing values come back as None so callers can distinguish
+    "offline" (online == 0) from "unknown" (online is None).
+    """
+    s = state or {}
+
+    def _as_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "online": _as_int(s.get("online")),
+        "awake": _as_int(s.get("awake")),
+        "battery_level": _as_int(s.get("batteryLevel")),
+        "is_charging": _as_int(s.get("isCharging")),
+        "offline_time": s.get("offlineTime"),
+    }
 
 
 async def stop_live(ticket: dict) -> bool:

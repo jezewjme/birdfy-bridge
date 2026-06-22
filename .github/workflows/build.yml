@@ -24,7 +24,17 @@ jobs:
       - name: Lint
         run: ruff check .
       - name: Unit tests
-        run: pytest -q
+        # Coverage is reported per file for visibility only — no --cov-fail-under,
+        # so a low number never fails the build. NOTE: these are WHOLE-FILE
+        # numbers; the low ones (webrtc_client, birdfy_api, _rtp_forwarder) are
+        # dominated by live-network / WebRTC / ffmpeg-subprocess paths that need a
+        # real camera and aren't unit-testable. The logic added in unit-testable
+        # form is covered (~82% of changed lines).
+        run: |
+          pytest -q \
+            --cov=mqtt_control --cov=birdfy_api --cov=main \
+            --cov=webrtc_client --cov=_rtp_forwarder --cov=_aiortc_media_patches \
+            --cov-report=term-missing --no-cov-on-fail
 
   docker:
     runs-on: ubuntu-latest

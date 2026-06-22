@@ -24,6 +24,7 @@ ticket.signalPingInterval seconds (default: 2s).
 """
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -49,6 +50,28 @@ from _rtp_forwarder import forward_video
 from _sdp_patches import apply_offer_patches, extract_trickle_candidates
 
 logger = logging.getLogger(__name__)
+
+
+def _ws_header_kwargs(headers: dict) -> dict:
+    """Return the correct websockets.connect() kwarg for custom request headers.
+
+    websockets renamed `extra_headers` -> `additional_headers` in 14.0 and
+    *removed* the old name. On >=14, passing `extra_headers` is swallowed into
+    **kwargs and reaches asyncio's create_connection(), which raises
+    `TypeError: unexpected keyword argument 'extra_headers'`. That broke the
+    signaling WS — the connection died ~2s after opening — once the image
+    resolved a newer websockets despite the requirements `<14` pin. Detect which
+    name the installed connect() accepts so we work on both the legacy (<14) and
+    asyncio (>=14) implementations regardless of what actually resolves.
+    """
+    try:
+        params = inspect.signature(websockets.connect).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        params = {}
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    return {"extra_headers": headers}
+
 
 # SCTP role: aiortc default (is_server=False, SCTP client, sends INIT first).
 #
@@ -271,9 +294,11 @@ async def connect_and_stream(
                 logger.error("Video track received but no video receiver found — falling back to decode path")
                 asyncio.ensure_future(_stream_video(track, rtsp_output, ffmpeg_state, pc))
             else:
-                # Keep aiortc's track-drain loop running too, otherwise the
-                # decoder thread's output queue backs up and may block the
-                # decoder worker. _drain() is a no-op consumer.
+                # Keep aiortc's track-drain loop running too. The receiver's
+                # decoder worker thread still runs (we stub it to a no-op in
+                # _aiortc_media_patches, so it emits nothing), but draining the
+                # track is cheap and keeps recv() from ever backing up if the
+                # stub is disabled via BIRDFY_STUB_VIDEO_DECODE=0. No-op consumer.
                 asyncio.ensure_future(_drain(track))
                 # Grab the audio receiver (its transceiver was added up-front, so
                 # it exists regardless of whether the audio on("track") has fired
@@ -377,7 +402,7 @@ async def connect_and_stream(
     try:
         async with websockets.connect(
             url,
-            extra_headers={"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"},
+            **_ws_header_kwargs({"User-Agent": "Mozilla/5.0 (compatible; birdfy-bridge/1.0)"}),
             ping_interval=ping_interval,
             ping_timeout=10,
             close_timeout=5,
@@ -644,7 +669,10 @@ async def _stream_video(track, rtsp_output: str, state: dict, pc=None):
 
             try:
                 data = frame.to_ndarray(format="yuv420p")
-                proc.stdin.write(data.tobytes())  # type: ignore[union-attr]
+                # Offload the blocking stdin write so a stalled ffmpeg can't
+                # freeze the event loop (same fix as the RTP passthrough path).
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, proc.stdin.write, data.tobytes())  # type: ignore[union-attr]
             except BrokenPipeError:
                 logger.warning("ffmpeg pipe broken — reconnecting")
                 break
