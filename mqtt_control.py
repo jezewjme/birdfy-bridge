@@ -144,6 +144,12 @@ class MqttControl:
         # event) instead of only noticing at the top of the next loop iteration.
         # Created lazily on first access so MqttControl can be built off-loop.
         self._off_event: asyncio.Event | None = None
+        # Edge-triggered: set on *any* real mode change so the bridge loop can cut
+        # short whatever back-off / off-mode pause it's sitting in and re-evaluate
+        # immediately. Without it a mode flip only takes effect when the current
+        # asyncio.sleep happens to end — up to OFF_POLL_SECONDS (10 min) of lag.
+        # The loop clears it after waking (see sleep_until_mode_change).
+        self._mode_changed: asyncio.Event | None = None
 
     # ---- topic helpers ----
     @property
@@ -184,6 +190,35 @@ class MqttControl:
             if self._mode == "off":
                 self._off_event.set()
         return self._off_event
+
+    def _mode_changed_event(self) -> asyncio.Event:
+        """Internal accessor for the edge-triggered mode-change event (lazy)."""
+        if self._mode_changed is None:
+            self._mode_changed = asyncio.Event()
+        return self._mode_changed
+
+    async def sleep_until_mode_change(self, delay: float) -> bool:
+        """Sleep up to `delay` seconds, returning early on any mode change.
+
+        The bridge loop uses this instead of a bare asyncio.sleep so that flipping
+        the mode (off -> auto, auto -> off mid-pause, etc.) wakes it promptly
+        instead of waiting out a full back-off / off-mode cadence. Returns True if
+        a mode change interrupted the wait, False if the full delay elapsed. The
+        change event is cleared before returning so the next call starts fresh.
+        """
+        changed = self._mode_changed_event()
+        # Drain any change that fired while we weren't waiting so this call
+        # reflects only transitions during the sleep itself.
+        changed.clear()
+        if delay <= 0:
+            return False
+        try:
+            await asyncio.wait_for(changed.wait(), timeout=delay)
+            interrupted = True
+        except asyncio.TimeoutError:
+            interrupted = False
+        changed.clear()
+        return interrupted
 
     def configure(self, serial: str, device_name: str = "") -> None:
         """Bind the real device serial/name and start the task (idempotent).
@@ -309,6 +344,10 @@ class MqttControl:
             # Persist the new choice so it survives a container restart. Only on a
             # real change to avoid rewriting the file on every retained-mode echo.
             _write_persisted_mode(mode)
+            # Wake the bridge loop out of any back-off / off-mode pause so it
+            # re-evaluates against the new mode now, not at the next sleep edge.
+            if self._mode_changed is not None:
+                self._mode_changed.set()
         self._mode = mode
         # Release/re-arm any live session waiting on the off event.
         if self._off_event is not None:

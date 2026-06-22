@@ -508,7 +508,7 @@ async def main():
                     logger.info(
                         "Mode=off — entry poll failed, retrying in %ss ...", delay
                     )
-                    await asyncio.sleep(delay)
+                    await mqtt.sleep_until_mode_change(delay)
                     continue
             elif OFF_POLL_SECONDS > 0:
                 # Steady-state passes just refresh on the OFF_POLL_SECONDS cadence.
@@ -517,7 +517,7 @@ async def main():
             # back-off cap (camera left fully alone; sensors hold their last value).
             delay = OFF_POLL_SECONDS if OFF_POLL_SECONDS > 0 else BACKOFF_SCHEDULE[-1]
             logger.info("Mode=off — bridge paused, re-checking mode in %ss ...", delay)
-            await asyncio.sleep(delay)
+            await mqtt.sleep_until_mode_change(delay)
             continue
         # Not off (or just left off): clear the sentinel so a genuinely stuck
         # stream can still go unhealthy, and reset the off-entry tracker so the
@@ -538,7 +538,7 @@ async def main():
             logger.info(
                 "%s — skipping handshake, re-checking in %ss ...", e, delay
             )
-            await asyncio.sleep(delay)
+            await mqtt.sleep_until_mode_change(delay)
             continue
         except Exception as e:
             logger.error(f"Bridge error: {e}", exc_info=(log_level == "DEBUG"))
@@ -564,7 +564,7 @@ async def main():
                     f"Short session ({elapsed:.0f}s, failure #{consecutive_failures}) "
                     f"— retrying in {delay}s ..."
                 )
-        await asyncio.sleep(delay)
+        await mqtt.sleep_until_mode_change(delay)
 
 
 if __name__ == "__main__":

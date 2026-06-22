@@ -90,6 +90,10 @@ class _SpyMqtt:
     def off_event(self):
         return self._off
 
+    async def sleep_until_mode_change(self, delay):
+        await asyncio.sleep(delay)
+        return False
+
 
 # --- run_once offline short-circuit --------------------------------------
 
@@ -247,6 +251,13 @@ class _ModeMqtt:
 
     def off_event(self):
         return self._off
+
+    async def sleep_until_mode_change(self, delay):
+        # Mirrors the real method when no mode change occurs: just sleeps `delay`.
+        # The tests patch main.asyncio.sleep to record delays / break the loop,
+        # so route through it to keep those assertions working.
+        await asyncio.sleep(delay)
+        return False
 
 
 @pytest.mark.parametrize(
