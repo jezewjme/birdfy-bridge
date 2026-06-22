@@ -138,6 +138,20 @@ BIG_FRAME_BYTES = 12000
 MAX_GARBAGE_DUMPS = 3
 
 
+class _LazyHex:
+    """Hex-dump the first 16 bytes of a frame, but only if the log record is
+    actually emitted. Passed as a %s arg so the (per-keyframe) formatting cost
+    is skipped when the level is filtered out."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __str__(self) -> str:
+        return self._data[:16].hex(" ")
+
+
 def _iter_nals(data: bytes):
     """Yield (nal_type, nal_bytes_with_start_code) for each NAL in Annex B data.
 
@@ -145,24 +159,17 @@ def _iter_nals(data: bytes):
     don't need to handle 3-byte variants. If a malformed frame ever shows up
     without start codes, we yield nothing — caller treats as "no SPS/PPS seen".
     """
-    pos = 0
-    n = len(data)
-    # Find the first start code
-    while pos < n - 3:
-        if data[pos:pos + 4] == _START_CODE:
-            break
-        pos += 1
-    else:
+    # bytes.find() scans for the start code in C — far cheaper than a Python
+    # byte-by-byte loop on a 12KB+ keyframe, which runs on the receive path.
+    pos = data.find(_START_CODE)
+    if pos < 0:
         return
 
+    n = len(data)
     while pos < n:
         # We're sitting on a start code. Find the next one.
-        end = pos + 4
-        while end < n - 3:
-            if data[end:end + 4] == _START_CODE:
-                break
-            end += 1
-        else:
+        end = data.find(_START_CODE, pos + 4)
+        if end < 0:
             end = n
 
         nal = data[pos:end]
@@ -596,11 +603,10 @@ async def forward_video(
             # Debug: log the first few frames' shape so we can see what aiortc
             # actually hands us (start-code layout, NAL types observed).
             if pre_proc_frames_dropped < 5 and proc is None:
-                head = data[:16].hex(" ")
                 logger.info(
                     "RTP forwarder: frame %d bytes head=%s start_code=%s nal_types=%s",
                     len(data),
-                    head,
+                    _LazyHex(data),
                     has_start_code,
                     nal_types,
                 )
@@ -611,14 +617,13 @@ async def forward_video(
             # is the failure we care about. Either way include the running tally
             # so a debug session can see whether keyframes stay clean.
             if len(data) >= BIG_FRAME_BYTES:
-                head = data[:16].hex(" ")
                 _level = logging.WARNING if is_garbage else logging.DEBUG
                 logger.log(
                     _level,
                     "RTP forwarder: BIG frame %d bytes head=%s start_code=%s "
                     "nal_types=%s garbage=%s (tally: frames=%d garbage=%d idr=%d)",
                     len(data),
-                    head,
+                    _LazyHex(data),
                     has_start_code,
                     nal_types,
                     is_garbage,
@@ -759,16 +764,7 @@ async def forward_video(
         _unwrap_jitter_buffer(receiver)
         if audio_enabled:
             _unwrap_jitter_buffer(audio_receiver)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.stdin.close()  # type: ignore[union-attr]
-            except Exception:
-                pass
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _reap_ffmpeg(proc)
         # Tear down the dedicated writer thread. ffmpeg's stdin is closed above,
         # so any in-flight write has unblocked; don't wait on a wedged write.
         write_pool.shutdown(wait=False)
