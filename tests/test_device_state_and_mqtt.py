@@ -180,6 +180,44 @@ async def test_apply_mode_rejects_invalid_and_accepts_valid(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sleep_until_mode_change_returns_false_on_timeout(monkeypatch):
+    # No mode change during the wait -> sleeps the full (tiny) delay, returns False.
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")
+    interrupted = await m.sleep_until_mode_change(0.01)
+    assert interrupted is False
+
+
+@pytest.mark.asyncio
+async def test_sleep_until_mode_change_wakes_on_mode_change(monkeypatch):
+    # The core fix: flipping the mode mid-sleep releases the wait immediately so
+    # the bridge re-evaluates instead of waiting out a 10-min off-mode cadence.
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")
+    client = _FakeClient()
+    sleeper = asyncio.ensure_future(m.sleep_until_mode_change(30))
+    # Yield so the sleeper is actually waiting before the mode flips.
+    await asyncio.sleep(0)
+    await m._apply_mode(client, b"off")
+    interrupted = await asyncio.wait_for(sleeper, timeout=1.0)
+    assert interrupted is True
+
+
+@pytest.mark.asyncio
+async def test_sleep_until_mode_change_ignores_non_change(monkeypatch):
+    # A retained-mode echo (same mode re-applied) is NOT a change and must not
+    # cut the sleep short — otherwise the loop would spin on every redelivery.
+    monkeypatch.setenv("MQTT_HOST", "broker.local")
+    m = MqttControl(MqttConfig(), serial="SN1")  # starts in "auto"
+    client = _FakeClient()
+    sleeper = asyncio.ensure_future(m.sleep_until_mode_change(0.05))
+    await asyncio.sleep(0)
+    await m._apply_mode(client, b"auto")  # same mode -> no change event
+    interrupted = await asyncio.wait_for(sleeper, timeout=1.0)
+    assert interrupted is False
+
+
+@pytest.mark.asyncio
 async def test_apply_mode_persists_to_file(monkeypatch):
     # A real mode change must be written to the persisted-mode file so it survives
     # a restart. The _isolate_mode_file fixture points _MODE_FILE at tmp.
