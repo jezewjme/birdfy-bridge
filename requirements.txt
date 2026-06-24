@@ -12,7 +12,7 @@ aiohttp>=3.14.1,<4.0
 # needed; allow the modern line (the container was already resolving 16.x).
 websockets>=12.0,<17.0
 av>=14.0.0,<17.0.0
-numpy>=2.4.6,<3.0
+numpy>=2.5.0,<3.0
 # Optional MQTT control/observability (mqtt_control.py). asyncio-native paho
 # wrapper. Only imported/used when MQTT_HOST is set; the bridge runs fine
 # without a broker. aiomqtt 2.x has a stable async context-manager API.
