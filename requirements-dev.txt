@@ -4,5 +4,5 @@ pytest-asyncio>=1.4.0,<2.0
 # Coverage reporting (not gated in CI). Measure the bridge modules with:
 #   pytest --cov=mqtt_control --cov=birdfy_api --cov=main --cov=webrtc_client \
 #          --cov=_rtp_forwarder --cov=_aiortc_media_patches --cov-report=term-missing
-pytest-cov>=6.0.0,<8.0
+pytest-cov>=7.1.0,<8.0
 ruff>=0.15.16,<1.0
